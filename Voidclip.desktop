@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Voidclip.mov
+GenericName=Video Segmenter
+Comment=Split long videos into TikTok/Reels/Shorts segments
+Exec=/home/hndrapratamaa/Voidclip.mov/run.sh
+Path=/home/hndrapratamaa/Voidclip.mov
+Icon=/home/hndrapratamaa/Voidclip.mov/assets/icons/voidclip_icon_128.png
+Terminal=false
+StartupNotify=true
+Categories=AudioVideo;Video;

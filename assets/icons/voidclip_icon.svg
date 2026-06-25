@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Background -->
+  <rect width="512" height="512" rx="112" fill="#0A0A0C"/>
+  <!-- Outer ring -->
+  <circle cx="256" cy="256" r="170" fill="none" stroke="#1E1E2A" stroke-width="2"/>
+  <!-- Inner void circle -->
+  <circle cx="256" cy="256" r="90" fill="#070709" stroke="#2A2A3E" stroke-width="1.5"/>
+  <!-- Indigo glow ring -->
+  <circle cx="256" cy="256" r="110" fill="none" stroke="#5E5CE6" stroke-width="3" stroke-dasharray="60 20 30 20" stroke-linecap="round"/>
+  <!-- Play triangle - offset left slightly for video vibe -->
+  <path d="M232 216 L232 296 L304 256 Z" fill="#5E5CE6"/>
+  <!-- Tiny dot accent top right -->
+  <circle cx="334" cy="178" r="6" fill="#30D158"/>
+  <!-- Scan lines texture - subtle -->
+  <line x1="86" y1="170" x2="170" y2="86" stroke="#1A1A26" stroke-width="1"/>
+  <line x1="342" y1="426" x2="426" y2="342" stroke="#1A1A26" stroke-width="1"/>
+  <!-- Bottom text -->
+  <text x="256" y="390" font-family="Courier New, monospace" font-size="28" font-weight="700" fill="#5E5CE6" text-anchor="middle" letter-spacing="4">VOID</text>
+  <text x="256" y="416" font-family="Courier New, monospace" font-size="14" fill="#333344" text-anchor="middle" letter-spacing="8">clip.mov</text>
+</svg>

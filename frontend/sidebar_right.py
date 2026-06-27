@@ -1,7 +1,8 @@
 from __future__ import annotations
+
 import os
-import sys
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -10,9 +11,11 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QFileSystemModel, QHBoxLayout, QPushButton,
-    QTreeView, QVBoxLayout, QWidget
+    QTreeView, QVBoxLayout, QWidget,
 )
+
 from backend.config import OUTPUT_DIR
+from backend.lang_id import BTN_BALIK
 
 
 class SidebarRight(QWidget):
@@ -21,17 +24,19 @@ class SidebarRight(QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        self.btn_back = QPushButton("⏴ Back")
-        self.btn_back.setFixedSize(70, 26)
+        self.btn_back = QPushButton("◀  Balik")
+        self.btn_back.setFixedSize(80, 28)
         self.btn_back.clicked.connect(self._go_back)
 
-        self.btn_explore = QPushButton("📁 Folder")
-        self.btn_explore.setFixedSize(80, 26)
+        self.btn_explore = QPushButton("📁  Folder")
+        self.btn_explore.setFixedSize(88, 28)
         self.btn_explore.clicked.connect(self._open_in_explorer)
 
         self.model = QFileSystemModel()
         self.model.setRootPath(str(OUTPUT_DIR))
-        self.model.setFilter(QDir.Filter.AllEntries | QDir.Filter.NoDotAndDotDot)
+        self.model.setFilter(
+            QDir.Filter.AllEntries | QDir.Filter.NoDotAndDotDot
+        )
 
         self.tree_view = QTreeView()
         self.tree_view.setModel(self.model)
@@ -49,15 +54,15 @@ class SidebarRight(QWidget):
         self.video_widget = QVideoWidget()
         self.player.setVideoOutput(self.video_widget)
 
-        self.btn_play = QPushButton("▶ Play / Pause")
-        self.btn_play.setFixedWidth(130)
+        self.btn_play = QPushButton("▶  Putar / Jeda")
+        self.btn_play.setFixedWidth(140)
         self.btn_play.clicked.connect(self._toggle_play)
 
     def _on_double_click(self, index) -> None:
         path = Path(self.model.filePath(index))
         if path.is_dir():
             self.tree_view.setRootIndex(index)
-        elif path.suffix == ".mp4":
+        elif path.suffix.lower() in {".mp4", ".mkv", ".mov", ".avi", ".webm"}:
             self.player.setSource(QUrl.fromLocalFile(str(path)))
             self.player.play()
 

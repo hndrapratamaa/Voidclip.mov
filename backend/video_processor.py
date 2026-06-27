@@ -1,417 +1,359 @@
-"""
-backend/video_processor.py
-==========================
-Lapisan tengah yang mengelola logika pekerjaan (job) secara stateless.
-
-Tanggung jawab:
-  - 'prepare_job': Menghitung daftar potongan segmen acak (tanpa DB).
-  - 'run_job': Mengeksekusi semua segmen secara sekuensial dan menghitung
-    progres live yang lengkap: seg_num, total_segs, seg_pct, overall_pct,
-    fps, speed, eta_sec — kemudian dikirim ke GUI via callback.
-  - Semua state disimpan sepenuhnya di memori RAM dalam dataclass Python.
-"""
-
 from __future__ import annotations
 
-import random
+import re
 import threading
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from backend.config import (
-    CACHE_DIR,
-    DEFAULT_WATERMARK_CONFIG,
-    DEFAULT_ZOOM_CONFIG,
-    OUTPUT_DIR,
-    RENDER_PRESETS,
-    DEFAULT_PRESET_NAME,
-    SEGMENT_DURATION_MAX,
-    SEGMENT_DURATION_MIN,
-    RenderPreset,
-    WatermarkConfig,
-    ZoomConfig,
-)
+from backend.config import OUTPUT_DIR, RENDER_PRESETS, DEFAULT_PRESET, TEMP_DIR
 from backend.ffmpeg_engine import (
-    LogCallback,
     VideoInfo,
+    SegmentPlan,
+    encode_segment,
+    plan_segments,
     probe_video,
-    render_segment,
+    stream_copy_cut,
 )
+from backend.logger import get_logger
+from backend.queue_manager import JobRecord, QueueManager, QueueState
+
+log = get_logger(__name__)
+
+LogCb      = Callable[[str], None]
+ProgressCb = Callable[[int, int, float, float, float, float, float], None]
+StatusCb   = Callable[[QueueState], None]
 
 
-# ---------------------------------------------------------------------------
-# Tipe data progres
-# ---------------------------------------------------------------------------
+class VideoProcessor:
+    def __init__(
+        self,
+        job:           JobRecord,
+        queue_manager: QueueManager,
+        preset_name:   str       = DEFAULT_PRESET,
+        subtitle_mode: str       = "keep",
+        log_cb:        Optional[LogCb]      = None,
+        progress_cb:   Optional[ProgressCb] = None,
+        status_cb:     Optional[StatusCb]   = None,
+    ) -> None:
+        self.job           = job
+        self.qm            = queue_manager
+        self.preset_name   = preset_name
+        self.subtitle_mode = subtitle_mode
+        self._log_cb       = log_cb
+        self._progress_cb  = progress_cb
+        self._status_cb    = status_cb
 
-@dataclass
-class SegmentProgress:
-    """
-    Snapshot progres yang dikirim ke UI setiap tick.
+        self._pause_event: threading.Event = threading.Event()
+        self._pause_event.set()
 
-    Semua field bersifat opsional (None = belum tersedia) agar
-    UI tidak crash jika data belum siap di awal segmen.
-    """
-    seg_num:     int            # Segmen ke-N yang sedang diproses (1-based)
-    total_segs:  int            # Total jumlah segmen dalam job ini
-    seg_pct:     float          # Kemajuan segmen saat ini (0.0–100.0)
-    overall_pct: float          # Kemajuan keseluruhan job (0.0–100.0)
-    fps:         float          # Frame per detik encode saat ini
-    speed:       float          # Kecepatan encode relatif (1.0 = realtime)
-    eta_sec:     float          # Perkiraan sisa waktu total job (detik)
-    current_output: Path        # Path file output segmen yang sedang dikerjakan
+        self._stop_flag:  threading.Event = threading.Event()
 
+        self._live_fps:   float = 0.0
+        self._live_speed: float = 0.0
+        self._start_time: float = 0.0
 
-# ---------------------------------------------------------------------------
-# Tipe callback ke GUI
-# ---------------------------------------------------------------------------
+    def pause(self) -> None:
+        log.info("Pause requested for job '%s'", self.job.filename)
+        self._pause_event.clear()
 
-ProgressCallback = Callable[[SegmentProgress], None]
-# LogCallback sudah diimport dari ffmpeg_engine
+    def resume(self) -> None:
+        log.info("Resume requested for job '%s'", self.job.filename)
+        self._pause_event.set()
+        self.qm.transition_running()
+        self._emit_status(QueueState.RUNNING)
 
+    def stop(self) -> None:
+        log.info("Stop requested for job '%s'", self.job.filename)
+        self._stop_flag.set()
+        self._pause_event.set()
 
-# ---------------------------------------------------------------------------
-# Dataclass: spec satu segmen
-# ---------------------------------------------------------------------------
+    def is_stop_requested(self) -> bool:
+        return self._stop_flag.is_set()
 
-@dataclass
-class SegmentSpec:
-    """Spesifikasi pemotongan satu segmen, dihitung saat prepare_job."""
-    index:        int     # Indeks 0-based
-    start_sec:    float   # Waktu mulai dalam video sumber (detik)
-    duration_sec: float   # Durasi segmen ini (detik)
-    zoom_crop_pct: float  # Persentase crop anti-copyright untuk segmen ini
-    output_path:  Path    # Path file output yang akan dibuat
+    def run(self) -> None:
+        self._start_time = time.monotonic()
+        source = self.job.source_path
+        self._log(f"▶  Starting: {source.name}")
 
-
-# ---------------------------------------------------------------------------
-# Dataclass: spesifikasi lengkap satu job
-# ---------------------------------------------------------------------------
-
-@dataclass
-class JobSpec:
-    """
-    Representasi lengkap satu pekerjaan render.
-    Tidak menyentuh disk — murni di RAM.
-    """
-    job_id:       str              # ID unik (timestamp + nama file)
-    input_path:   Path             # Video sumber
-    video_info:   VideoInfo        # Metadata video (dari probe)
-    segments:     List[SegmentSpec] = field(default_factory=list)
-    preset:       RenderPreset     = field(default_factory=lambda: RENDER_PRESETS[DEFAULT_PRESET_NAME])
-    watermark_cfg: WatermarkConfig = field(default_factory=lambda: DEFAULT_WATERMARK_CONFIG)
-    zoom_config:  ZoomConfig       = field(default_factory=lambda: DEFAULT_ZOOM_CONFIG)
-    output_dir:   Path             = field(default_factory=lambda: OUTPUT_DIR)
-    # Metadata runtime (diisi saat run_job)
-    start_time:   Optional[float]  = None   # time.monotonic() saat job dimulai
-    end_time:     Optional[float]  = None   # time.monotonic() saat job selesai/gagal
-    error:        Optional[str]    = None   # Pesan error jika gagal
-
-    @property
-    def total_segments(self) -> int:
-        return len(self.segments)
-
-    @property
-    def total_input_duration(self) -> float:
-        """Total durasi semua segmen (bisa < durasi video asli)."""
-        return sum(s.duration_sec for s in self.segments)
-
-    @property
-    def elapsed_sec(self) -> float:
-        """Waktu berjalan job dalam detik (0 jika belum mulai)."""
-        if self.start_time is None:
-            return 0.0
-        end = self.end_time if self.end_time is not None else time.monotonic()
-        return max(0.0, end - self.start_time)
-
-
-# ---------------------------------------------------------------------------
-# prepare_job
-# ---------------------------------------------------------------------------
-
-def prepare_job(
-    input_path:    Path,
-    preset_name:   str              = DEFAULT_PRESET_NAME,
-    watermark_cfg: WatermarkConfig  = DEFAULT_WATERMARK_CONFIG,
-    zoom_config:   ZoomConfig       = DEFAULT_ZOOM_CONFIG,
-    output_dir:    Optional[Path]   = None,
-    seed:          Optional[int]    = None,
-) -> JobSpec:
-    """
-    Hitung rencana pemotongan video menjadi segmen-segmen acak.
-
-    Proses:
-    1. Probe video untuk mendapatkan durasi dan resolusi.
-    2. Bagi durasi video menjadi segmen dengan panjang acak
-       antara SEGMENT_DURATION_MIN dan SEGMENT_DURATION_MAX.
-    3. Tiap segmen mendapat nilai zoom_crop_pct acak dalam range
-       zoom_config.zoom_min_pct hingga zoom_config.zoom_max_pct.
-    4. Kembalikan JobSpec lengkap yang siap di-pass ke run_job.
-
-    Tidak ada file yang dibuat atau database yang disentuh.
-    """
-    if not input_path.exists():
-        raise FileNotFoundError(f"File input tidak ditemukan: {input_path}")
-
-    rng = random.Random(seed)   # deterministik jika seed diberikan
-
-    # --- Probe video ---
-    video_info = probe_video(input_path)
-
-    # --- Buat job ID ---
-    import time as _time
-    ts = int(_time.time())
-    job_id = f"{ts}_{input_path.stem[:32]}"
-
-    # --- Tentukan direktori output ---
-    out_dir = output_dir or OUTPUT_DIR
-    job_out_dir = out_dir / job_id
-    # Direktori belum dibuat di sini; dibuat saat render_segment dipanggil
-
-    # --- Resolusi preset ---
-    preset = RENDER_PRESETS.get(preset_name, RENDER_PRESETS[DEFAULT_PRESET_NAME])
-
-    # --- Hitung segmen ---
-    segments: list[SegmentSpec] = []
-    total_duration = video_info.duration
-    cursor = 0.0
-    seg_index = 0
-
-    while cursor < total_duration:
-        remaining = total_duration - cursor
-
-        # Jika sisa durasi lebih pendek dari minimum, sisipkan ke segmen terakhir
-        # atau buat segmen pendek terakhir (jika minimal 10 detik)
-        if remaining < SEGMENT_DURATION_MIN:
-            if segments:
-                # Perpanjang segmen terakhir agar menelan sisa
-                last = segments[-1]
-                segments[-1] = SegmentSpec(
-                    index=last.index,
-                    start_sec=last.start_sec,
-                    duration_sec=last.duration_sec + remaining,
-                    zoom_crop_pct=last.zoom_crop_pct,
-                    output_path=last.output_path,
-                )
-            # Jika sisa < 10 detik dan belum ada segmen, skip (video terlalu pendek)
-            elif remaining >= 10.0:
-                zoom_pct = rng.uniform(zoom_config.zoom_min_pct, zoom_config.zoom_max_pct)
-                out_file = job_out_dir / f"segment_{seg_index:04d}.mp4"
-                segments.append(SegmentSpec(
-                    index=seg_index,
-                    start_sec=cursor,
-                    duration_sec=remaining,
-                    zoom_crop_pct=round(zoom_pct, 2),
-                    output_path=out_file,
-                ))
-            break
-
-        # Durasi segmen acak
-        seg_dur = rng.uniform(
-            float(SEGMENT_DURATION_MIN),
-            float(SEGMENT_DURATION_MAX),
-        )
-        # Jangan melebihi sisa
-        seg_dur = min(seg_dur, remaining)
-
-        zoom_pct = rng.uniform(zoom_config.zoom_min_pct, zoom_config.zoom_max_pct)
-        out_file = job_out_dir / f"segment_{seg_index:04d}.mp4"
-
-        segments.append(SegmentSpec(
-            index=seg_index,
-            start_sec=round(cursor, 3),
-            duration_sec=round(seg_dur, 3),
-            zoom_crop_pct=round(zoom_pct, 2),
-            output_path=out_file,
-        ))
-
-        cursor += seg_dur
-        seg_index += 1
-
-    if not segments:
-        raise ValueError(
-            f"Video terlalu pendek ({total_duration:.1f}s) untuk dibagi "
-            f"menjadi segmen minimal {SEGMENT_DURATION_MIN}s."
-        )
-
-    return JobSpec(
-        job_id=job_id,
-        input_path=input_path,
-        video_info=video_info,
-        segments=segments,
-        preset=preset,
-        watermark_cfg=watermark_cfg,
-        zoom_config=zoom_config,
-        output_dir=job_out_dir,
-    )
-
-
-# ---------------------------------------------------------------------------
-# run_job
-# ---------------------------------------------------------------------------
-
-def run_job(
-    job:               JobSpec,
-    log_callback:      Optional[LogCallback]      = None,
-    progress_callback: Optional[ProgressCallback] = None,
-    cancel_event:      Optional[threading.Event]  = None,
-) -> None:
-    """
-    Eksekusi semua segmen dalam JobSpec secara sekuensial.
-
-    Menghitung progres live:
-      - seg_pct      : kemajuan segmen yang sedang berjalan (0–100)
-      - overall_pct  : kemajuan keseluruhan job berdasarkan durasi (0–100)
-      - fps / speed  : diambil dari laporan FFmpeg terbaru
-      - eta_sec      : estimasi sisa waktu berdasarkan kecepatan encode
-
-    Semua data progres dikirim ke 'progress_callback' sebagai SegmentProgress.
-    Semua log dikirim ke 'log_callback' sebagai string.
-
-    Raise
-    -----
-    RuntimeError  : Jika segmen gagal dirender.
-    """
-
-    def _log(msg: str) -> None:
-        if log_callback:
-            log_callback(msg)
-
-    total_segs       = job.total_segments
-    total_job_dur    = job.total_input_duration  # detik total semua segmen
-    completed_dur    = 0.0                        # durasi segmen yang sudah selesai
-
-    # State live yang di-update oleh closure bawah
-    _state: dict = {
-        "seg_pct":    0.0,
-        "fps":        0.0,
-        "speed":      1.0,
-        "last_tick":  time.monotonic(),
-    }
-
-    job.start_time = time.monotonic()
-
-    _log(f"[job] Memulai job '{job.job_id}': {total_segs} segmen, "
-         f"total ~{total_job_dur:.0f}s dari '{job.input_path.name}'")
-
-    for seg in job.segments:
-        seg_num = seg.index + 1  # 1-based untuk UI
-
-        if cancel_event is not None and cancel_event.is_set():
-            _log("[job] Cancel sebelum segmen dimulai.")
-            raise RuntimeError("Job dibatalkan oleh pengguna.")
-
-        _log(f"[job] Segmen {seg_num}/{total_segs} | "
-             f"start={seg.start_sec:.1f}s dur={seg.duration_sec:.1f}s "
-             f"zoom={seg.zoom_crop_pct:.1f}%")
-
-        # Reset state per segmen
-        _state["seg_pct"]   = 0.0
-        _state["fps"]       = 0.0
-        _state["speed"]     = 1.0
-        _state["last_tick"] = time.monotonic()
-
-        seg_start_monotonic = time.monotonic()
-
-        def _on_seg_progress(seg_pct: float) -> None:
-            """
-            Callback internal yang dipanggil ffmpeg_engine saat ada progres
-            pada segmen yang sedang berjalan.
-            """
-            now = time.monotonic()
-            _state["seg_pct"] = seg_pct
-
-            # Hitung elapsed sejak segmen ini mulai
-            seg_elapsed = max(0.001, now - seg_start_monotonic)
-
-            # Estimasi fps dari rasio frame/waktu
-            # FFmpeg kadang memberi 0 fps di awal; jaga agar tidak NaN
-            estimated_fps = (seg_pct / 100.0 * seg.duration_sec * job.video_info.fps) / seg_elapsed
-            if estimated_fps > 0:
-                _state["fps"] = round(estimated_fps, 1)
-
-            # Speed: perbandingan encoded time vs wallclock time
-            encoded_sec = (seg_pct / 100.0) * seg.duration_sec
-            speed = encoded_sec / seg_elapsed if seg_elapsed > 0 else 1.0
-            _state["speed"] = round(max(0.01, speed), 2)
-
-            # Overall pct: durasi selesai + porsi segmen ini
-            seg_done_dur = (seg_pct / 100.0) * seg.duration_sec
-            overall_done = completed_dur + seg_done_dur
-            overall_pct  = min(100.0, (overall_done / total_job_dur) * 100.0) if total_job_dur > 0 else 0.0
-
-            # ETA: sisa waktu keseluruhan
-            remaining_job_dur = total_job_dur - overall_done
-            effective_speed   = max(0.01, _state["speed"])
-            eta_sec = remaining_job_dur / effective_speed
-
-            if progress_callback:
-                progress_callback(SegmentProgress(
-                    seg_num=seg_num,
-                    total_segs=total_segs,
-                    seg_pct=round(seg_pct, 2),
-                    overall_pct=round(overall_pct, 2),
-                    fps=_state["fps"],
-                    speed=_state["speed"],
-                    eta_sec=round(max(0.0, eta_sec), 1),
-                    current_output=seg.output_path,
-                ))
-
-        # --- Jalankan satu segmen ---
         try:
-            render_segment(
-                input_path=job.input_path,
-                output_path=seg.output_path,
-                start_sec=seg.start_sec,
-                duration_sec=seg.duration_sec,
-                zoom_crop_pct=seg.zoom_crop_pct,
-                preset=job.preset,
-                watermark_cfg=job.watermark_cfg,
-                log_callback=log_callback,
-                progress_callback=_on_seg_progress,
-                cancel_event=cancel_event,
+            info = probe_video(source)
+        except Exception as exc:
+            self._fail(f"Probe failed: {exc}")
+            return
+
+        self._log(
+            f"   Duration: {info.duration:.1f}s  |  "
+            f"{info.width}×{info.height}  |  {info.fps:.2f} fps"
+        )
+
+        segments: List[SegmentPlan] = plan_segments(info)
+        if not segments:
+            self._fail("No processable segments found (video too short?).")
+            return
+
+        self.qm.set_segments(self.job, len(segments))
+        self._log(f"   Planned {len(segments)} segment(s)")
+
+        preset_cfg = RENDER_PRESETS.get(
+            self.preset_name,
+            list(RENDER_PRESETS.values())[0],
+        )
+        container = preset_cfg.get("container", "mp4")
+
+        out_dir = OUTPUT_DIR / source.stem
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for seg in segments:
+            if self._stop_flag.is_set():
+                self._log("⏹  Stopped before segment %d" % seg.index)
+                break
+
+            if not self._pause_event.is_set():
+                self._log("⏸  Holding — waiting for resume…")
+                self.qm.transition_paused()
+                self._emit_status(QueueState.PAUSED)
+                self._pause_event.wait()
+                if self._stop_flag.is_set():
+                    self._log("⏹  Stopped during pause hold")
+                    break
+                self._log("▶  Resuming from segment %d" % seg.index)
+
+            seg_label = f"[{seg.index + 1}/{len(segments)}]"
+            self._log(
+                f"   {seg_label} Cutting  {seg.start:.1f}s + {seg.duration:.1f}s  "
+                f"(zoom {seg.zoom*100:.1f}%)"
             )
-        except RuntimeError as exc:
-            job.error = str(exc)
-            job.end_time = time.monotonic()
-            _log(f"[job] ERROR pada segmen {seg_num}: {exc}")
-            raise
 
-        # Segmen selesai; akumulasikan durasi
-        completed_dur += seg.duration_sec
+            try:
+                tmp_cut = stream_copy_cut(source, seg, TEMP_DIR)
+            except Exception as exc:
+                self._log(f"   {seg_label} ✘ Cut failed: {exc}")
+                log.warning("Stream-copy cut error for seg %d: %s", seg.index, exc)
+                continue
 
-        # Kirim snapshot 100% segmen ini
-        if progress_callback:
-            overall_pct = min(100.0, (completed_dur / total_job_dur) * 100.0) if total_job_dur > 0 else 100.0
-            progress_callback(SegmentProgress(
-                seg_num=seg_num,
-                total_segs=total_segs,
-                seg_pct=100.0,
-                overall_pct=round(overall_pct, 2),
-                fps=_state["fps"],
-                speed=_state["speed"],
-                eta_sec=0.0,
-                current_output=seg.output_path,
-            ))
+            clean_base = re.sub(r'S(\d+)\s+E(\d+)', r'S\1E\2', source.stem)
+            actual_part = self.job.segments_done + 1
+            out_filename = f"{clean_base} Part {actual_part:03d}.{container}"
+            output_path  = out_dir / out_filename
 
-        _log(f"[job] Segmen {seg_num}/{total_segs} selesai → {seg.output_path.name}")
+            self._log(f"   {seg_label} Encoding → {out_filename}")
+            seg_start_time = time.monotonic()
 
-    job.end_time = time.monotonic()
-    elapsed = job.elapsed_sec
+            def _progress_inner(
+                seg_pct: float,
+                fps:     float,
+                speed:   float,
+                _seg=seg,
+                _segs=segments,
+                _seg_start=seg_start_time,
+            ) -> None:
+                self._live_fps   = fps
+                self._live_speed = speed
+                done_segs    = self.job.segments_done
+                overall_pct  = (
+                    (done_segs + seg_pct / 100.0) / max(len(_segs), 1)
+                ) * 100.0
+                frames_left = max(0.0, 100.0 - seg_pct) / 100.0 * info.fps * _seg.duration
+                eta         = (frames_left / fps) if fps > 0 else 0.0
+                self._emit_progress(
+                    seg_num=_seg.index + 1,
+                    total=len(_segs),
+                    seg_pct=seg_pct,
+                    overall_pct=overall_pct,
+                    fps=fps,
+                    speed=speed,
+                    eta=eta,
+                )
 
-    _log(f"[job] Job '{job.job_id}' SELESAI dalam {elapsed:.1f}s. "
-         f"Output: {job.output_dir}")
+            try:
+                encode_segment(
+                    tmp_source    = tmp_cut,
+                    output_path   = output_path,
+                    info          = info,
+                    seg           = seg,
+                    preset_cfg    = preset_cfg,
+                    subtitle_mode = self.subtitle_mode,
+                    progress_cb   = _progress_inner,
+                    stop_flag     = self.is_stop_requested,
+                )
+            except Exception as exc:
+                self._log(f"   {seg_label} ✘ Encode error: {exc}")
+                log.error("Encode error seg %d: %s", seg.index, exc, exc_info=True)
+                continue
+            finally:
+                try:
+                    tmp_cut.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-    # Kirim progres final 100%
-    if progress_callback:
-        progress_callback(SegmentProgress(
-            seg_num=total_segs,
-            total_segs=total_segs,
-            seg_pct=100.0,
-            overall_pct=100.0,
-            fps=_state["fps"],
-            speed=_state["speed"],
-            eta_sec=0.0,
-            current_output=job.segments[-1].output_path if job.segments else Path("."),
-        ))
+            if self._stop_flag.is_set():
+                self._log(f"   {seg_label} Encode aborted by stop")
+                break
+
+            self.qm.increment_segment(self.job)
+            elapsed_seg = time.monotonic() - seg_start_time
+            self._log(
+                f"   {seg_label} ✔  Done  ({elapsed_seg:.1f}s)  → {output_path.name}"
+            )
+
+        if self._stop_flag.is_set():
+            self.qm.mark_cancelled(self.job)
+            self._log(f"⏹  Job cancelled: {source.name}")
+        else:
+            self.qm.mark_done(self.job)
+            total_elapsed = time.monotonic() - self._start_time
+            self._log(
+                f"✔  Finished: {source.name}  "
+                f"({self.job.segments_done}/{len(segments)} segments, "
+                f"{total_elapsed:.1f}s total)"
+            )
+
+    def _log(self, msg: str) -> None:
+        log.info(msg)
+        if self._log_cb:
+            try:
+                self._log_cb(msg)
+            except Exception:
+                pass
+
+    def _emit_progress(
+        self,
+        seg_num:     int,
+        total:       int,
+        seg_pct:     float,
+        overall_pct: float,
+        fps:         float,
+        speed:       float,
+        eta:         float,
+    ) -> None:
+        if self._progress_cb:
+            try:
+                self._progress_cb(seg_num, total, seg_pct, overall_pct, fps, speed, eta)
+            except Exception:
+                pass
+
+    def _emit_status(self, state: QueueState) -> None:
+        if self._status_cb:
+            try:
+                self._status_cb(state)
+            except Exception:
+                pass
+
+    def _fail(self, reason: str) -> None:
+        self._log(f"✘  Error: {reason}")
+        self.qm.mark_failed(self.job, reason)
+        log.error("Job '%s' failed: %s", self.job.filename, reason)
+
+
+class ProcessorPool:
+    def __init__(
+        self,
+        queue_manager: QueueManager,
+        log_cb:        Optional[LogCb]      = None,
+        progress_cb:   Optional[ProgressCb] = None,
+        status_cb:     Optional[StatusCb]   = None,
+    ) -> None:
+        self.qm          = queue_manager
+        self._log_cb     = log_cb
+        self._progress_cb = progress_cb
+        self._status_cb  = status_cb
+
+        self._preset_name:   str = DEFAULT_PRESET
+        self._subtitle_mode: str = "keep"
+
+        self._thread:    Optional[threading.Thread]    = None
+        self._active:    Optional[VideoProcessor]      = None
+        self._lock:      threading.Lock                = threading.Lock()
+
+    def set_preset(self, name: str) -> None:
+        self._preset_name = name
+
+    def set_subtitle_mode(self, mode: str) -> None:
+        self._subtitle_mode = mode
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(
+                target=self._worker,
+                name="voidclip-worker",
+                daemon=True,
+            )
+            self._thread.start()
+            log.info("Worker thread started")
+
+    def pause(self) -> None:
+        with self._lock:
+            p = self._active
+        if p:
+            p.pause()
+
+    def resume(self) -> None:
+        with self._lock:
+            p = self._active
+        if p:
+            p.resume()
+
+    def stop(self) -> None:
+        with self._lock:
+            p = self._active
+        if p:
+            p.stop()
+
+    def is_alive(self) -> bool:
+        with self._lock:
+            return bool(self._thread and self._thread.is_alive())
+
+    def _worker(self) -> None:
+        log.info("Worker: entered job loop")
+        self._emit_status(QueueState.RUNNING)
+
+        while True:
+            job = self.qm.next_pending()
+            if job is None:
+                log.info("Worker: no more pending jobs — exiting")
+                break
+
+            processor = VideoProcessor(
+                job           = job,
+                queue_manager = self.qm,
+                preset_name   = self._preset_name,
+                subtitle_mode = self._subtitle_mode,
+                log_cb        = self._log_cb,
+                progress_cb   = self._progress_cb,
+                status_cb     = self._status_cb,
+            )
+            with self._lock:
+                self._active = processor
+
+            self.qm.mark_running(job)
+            self._emit_status(QueueState.RUNNING)
+
+            try:
+                processor.run()
+            except Exception as exc:
+                log.error("Unexpected error in processor.run(): %s", exc, exc_info=True)
+
+            with self._lock:
+                self._active = None
+
+            if processor.is_stop_requested():
+                log.info("Worker: stop flag set — draining remaining jobs as cancelled")
+                remaining = self.qm.next_pending()
+                while remaining is not None:
+                    self.qm.mark_cancelled(remaining)
+                    remaining = self.qm.next_pending()
+                break
+
+        self.qm.transition_idle()
+        self._emit_status(QueueState.IDLE)
+        log.info("Worker: exited cleanly")
+
+    def _emit_status(self, state: QueueState) -> None:
+        if self._status_cb:
+            try:
+                self._status_cb(state)
+            except Exception:
+                pass

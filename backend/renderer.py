@@ -1,461 +1,281 @@
 """
 backend/renderer.py
-===================
-Jembatan kontroler (Facade) antara backend processing dan GUI PySide6.
+─────────────────────────────────────────────────────────────────────────────
+Voidclip.mov — Renderer: primary facade between the frontend and all backend
+               systems.
 
-Membungkus run_job ke dalam threading.Thread standar (kompatibel dengan
-PySide6 QThread maupun threading biasa) agar GUI tidak macet saat render.
+The frontend (MainWindow, RenderPanel) interacts exclusively with this class.
+It never imports ffmpeg_engine, video_processor, or queue_manager directly.
 
-Pola komunikasi:
-  GUI membuat RenderController, mendaftar callback, lalu memanggil .start().
-  Semua callback dipanggil dari thread worker — GUI harus menggunakan
-  Qt signal/slot atau QMetaObject.invokeMethod untuk update widget yang aman.
+Public interface (matched to MainWindow._wire_signals and button slots)
+────────────────────────────────────────────────────────────────────────
+    renderer.initialise()                   — reset to clean state
+    renderer.get_state() → QueueState       — current state snapshot
+    renderer.add_sources(paths)             — enqueue one or more source files
+    renderer.start()                        — begin processing the queue
+    renderer.pause()                        — pause after current segment
+    renderer.resume()                       — resume from pause
+    renderer.stop()                         — abort processing
+    renderer.set_preset(name)               — change render preset
+    renderer.set_subtitle_mode(mode)        — change subtitle handling
+    renderer.set_on_log(cb)                 — register log callback
+    renderer.set_on_progress(cb)            — register progress callback
+    renderer.set_on_state_changed(cb)       — register state callback
 
-Kelas utama:
-  - RenderController  : Thread wrapper utama dengan sinyal-sinyal progres.
-  - RenderControllerQt: Subklass QThread untuk PySide6 (import bersyarat).
+Thread safety
+─────────────
+All public methods are safe to call from the Qt main thread.
+Callbacks are invoked from the background worker thread — the MainWindow
+uses Qt Signals (sig_log, sig_progress, sig_state) as the cross-thread
+bridge, which is why the callbacks simply emit() those signals.
+─────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
 
 import threading
-import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
-from backend.config import (
-    DEFAULT_PRESET_NAME,
-    DEFAULT_WATERMARK_CONFIG,
-    DEFAULT_ZOOM_CONFIG,
-    OUTPUT_DIR,
-    RENDER_PRESETS,
-    WatermarkConfig,
-    ZoomConfig,
-)
-from backend.video_processor import (
-    JobSpec,
-    ProgressCallback,
-    SegmentProgress,
-    prepare_job,
-    run_job,
-)
+from backend.config import DEFAULT_PRESET, DEFAULT_SUBTITLE_MODE
+from backend.logger import get_logger
+from backend.queue_manager import QueueManager, QueueState
+from backend.video_processor import ProcessorPool
+
+log = get_logger(__name__)
+
+# Callback type aliases
+LogCb      = Callable[[str], None]
+ProgressCb = Callable[[int, int, float, float, float, float, float], None]
+StatusCb   = Callable[[QueueState], None]
 
 
-# ---------------------------------------------------------------------------
-# Tipe callback yang diekspos ke GUI
-# ---------------------------------------------------------------------------
-
-LogCallback      = Callable[[str], None]
-FinishCallback   = Callable[[bool, Optional[str]], None]
-# bool = sukses, str = pesan error atau None
-
-
-# ---------------------------------------------------------------------------
-# Dataclass konfigurasi render yang dikirim dari GUI
-# ---------------------------------------------------------------------------
-
-@dataclass
-class RenderRequest:
+class Renderer:
     """
-    Parameter render yang diisi oleh GUI dan dikirimkan ke RenderController.
-    Semua nilai memiliki default yang masuk akal agar GUI tidak wajib mengisi semua.
-    """
-    input_path:    Path
-    preset_name:   str            = DEFAULT_PRESET_NAME
-    watermark_cfg: WatermarkConfig = None   # type: ignore[assignment]
-    zoom_config:   ZoomConfig      = None   # type: ignore[assignment]
-    output_dir:    Optional[Path]  = None
-    seed:          Optional[int]   = None   # None = benar-benar acak
+    Top-level application facade.
 
-    def __post_init__(self) -> None:
-        if self.watermark_cfg is None:
-            self.watermark_cfg = DEFAULT_WATERMARK_CONFIG
-        if self.zoom_config is None:
-            self.zoom_config = DEFAULT_ZOOM_CONFIG
-        if self.output_dir is None:
-            self.output_dir = OUTPUT_DIR
+    Owns:
+      - one QueueManager  (in-memory job list)
+      - one ProcessorPool (background worker thread)
 
-
-# ---------------------------------------------------------------------------
-# RenderController: threading.Thread biasa (backend-agnostic)
-# ---------------------------------------------------------------------------
-
-class RenderController(threading.Thread):
-    """
-    Thread controller untuk satu pekerjaan render.
-
-    Cara pakai (threading murni, tanpa PySide6):
-    -----------------------------------------------
-        req = RenderRequest(input_path=Path("video.mp4"))
-        ctrl = RenderController(request=req)
-        ctrl.on_log      = lambda msg: print(msg)
-        ctrl.on_progress = lambda p: print(f"Overall: {p.overall_pct:.1f}%")
-        ctrl.on_finish   = lambda ok, err: print("OK" if ok else f"Error: {err}")
-        ctrl.start()
-        ctrl.join()   # blokir sampai selesai (opsional)
-
-    Cara cancel:
-        ctrl.cancel()
-
-    Cara pakai di PySide6 (non-QThread):
-    -------------------------------------
-        Gunakan QMetaObject.invokeMethod atau emit signal dari dalam callback
-        untuk memastikan pembaruan UI terjadi di main thread.
-        Atau gunakan subklass RenderControllerQt di bawah.
+    Does NOT own any Qt objects — stays framework-agnostic.
     """
 
-    def __init__(
-        self,
-        request: RenderRequest,
-        on_log:      Optional[LogCallback]      = None,
-        on_progress: Optional[ProgressCallback] = None,
-        on_finish:   Optional[FinishCallback]   = None,
-    ) -> None:
-        super().__init__(daemon=True, name=f"RenderThread-{request.input_path.stem[:20]}")
-        self.request    = request
-        self.on_log     = on_log
-        self.on_progress = on_progress
-        self.on_finish   = on_finish
+    def __init__(self) -> None:
+        self._qm:   QueueManager   = QueueManager()
+        self._pool: ProcessorPool  = ProcessorPool(self._qm)
 
-        self._cancel_event = threading.Event()
-        self._job: Optional[JobSpec] = None
-        self._success: Optional[bool] = None
-        self._error_msg: Optional[str] = None
+        # Registered callbacks
+        self._on_log:      Optional[LogCb]      = None
+        self._on_progress: Optional[ProgressCb] = None
+        self._on_state:    Optional[StatusCb]   = None
 
-    # ------------------------------------------------------------------
-    # Properti publik (aman dibaca dari thread manapun)
-    # ------------------------------------------------------------------
+        # Active settings
+        self._preset_name:   str = DEFAULT_PRESET
+        self._subtitle_mode: str = DEFAULT_SUBTITLE_MODE.value
 
-    @property
-    def is_running(self) -> bool:
-        """True jika thread sedang berjalan."""
-        return self.is_alive()
+        # Wire pool callbacks
+        self._pool._log_cb      = self._dispatch_log
+        self._pool._progress_cb = self._dispatch_progress
+        self._pool._status_cb   = self._dispatch_state
 
-    @property
-    def job(self) -> Optional[JobSpec]:
-        """JobSpec yang sedang/sudah dikerjakan (None sebelum run)."""
-        return self._job
+        log.debug("Renderer created")
 
-    @property
-    def succeeded(self) -> Optional[bool]:
-        """True/False setelah selesai, None saat masih berjalan."""
-        return self._success
+    # ── Lifecycle ───────────────────────────────────────────────────────────
 
-    @property
-    def error_message(self) -> Optional[str]:
-        """Pesan error terakhir, atau None jika sukses."""
-        return self._error_msg
-
-    # ------------------------------------------------------------------
-    # Kontrol
-    # ------------------------------------------------------------------
-
-    def cancel(self) -> None:
+    def initialise(self) -> None:
         """
-        Kirim sinyal cancel ke proses FFmpeg yang sedang berjalan.
-        Thread akan berhenti setelah segmen aktif selesai dibatalkan.
+        Reset to a clean idle state.
+
+        Called at startup and by the Refresh button.
+        Clears all jobs from the queue; does NOT touch the filesystem.
         """
-        self._cancel_event.set()
-        if self.on_log:
-            self.on_log("[controller] Permintaan cancel dikirim...")
+        # Stop any running pool gracefully (instant for idle, no-op if idle)
+        if self._pool.is_alive():
+            self._pool.stop()
+            # Give the thread a moment to exit; don't block the UI
+            threading.Thread(
+                target=self._wait_for_pool, daemon=True
+            ).start()
 
-    def wait_done(self, timeout: Optional[float] = None) -> bool:
+        self._qm.hard_reset()
+        self._pool = ProcessorPool(self._qm)
+        self._pool._log_cb      = self._dispatch_log
+        self._pool._progress_cb = self._dispatch_progress
+        self._pool._status_cb   = self._dispatch_state
+        self._pool.set_preset(self._preset_name)
+        self._pool.set_subtitle_mode(self._subtitle_mode)
+
+        self._dispatch_state(QueueState.IDLE)
+        log.info("Renderer initialised — queue cleared")
+
+    def _wait_for_pool(self) -> None:
+        """Background helper: wait for the old pool thread to die."""
+        if self._pool._thread:
+            self._pool._thread.join(timeout=5.0)
+
+    # ── Queue management ────────────────────────────────────────────────────
+
+    def add_sources(self, paths: List[Path]) -> None:
         """
-        Blokir sampai thread selesai.
-        Kembalikan True jika thread selesai dalam waktu timeout.
+        Enqueue one or more video source files.
+
+        Duplicate paths (already in queue as PENDING) are silently ignored.
         """
-        self.join(timeout=timeout)
-        return not self.is_alive()
+        existing = {
+            j.source_path
+            for j in self._qm.all_jobs()
+        }
+        added = 0
+        for p in paths:
+            p = Path(p)
+            if not p.exists():
+                self._dispatch_log(f"⚠  Skipping missing file: {p.name}")
+                log.warning("add_sources: path does not exist: %s", p)
+                continue
+            if p in existing:
+                self._dispatch_log(f"   Already queued: {p.name}")
+                continue
+            self._qm.enqueue(p)
+            self._dispatch_log(f"   Queued: {p.name}")
+            existing.add(p)
+            added += 1
 
-    # ------------------------------------------------------------------
-    # Entri titik thread
-    # ------------------------------------------------------------------
+        log.info("add_sources: %d file(s) enqueued", added)
 
-    def run(self) -> None:
+    # ── Processing control ──────────────────────────────────────────────────
+
+    def start(self) -> None:
         """
-        Entri titik eksekusi thread.
-        Dipanggil otomatis oleh .start().
+        Begin processing all queued jobs.
+
+        If the pool is already running (e.g. called twice), the second call
+        is a no-op — the pool handles this gracefully.
         """
-        req = self.request
-
-        def _log(msg: str) -> None:
-            if self.on_log:
-                self.on_log(msg)
-
-        _log(f"[controller] Memulai: '{req.input_path.name}' | "
-             f"preset='{req.preset_name}'")
-
-        # --- Fase 1: Siapkan job (probe + hitung segmen) ---
-        try:
-            self._job = prepare_job(
-                input_path=req.input_path,
-                preset_name=req.preset_name,
-                watermark_cfg=req.watermark_cfg,
-                zoom_config=req.zoom_config,
-                output_dir=req.output_dir,
-                seed=req.seed,
-            )
-        except Exception as exc:
-            self._success = False
-            self._error_msg = f"Gagal menyiapkan job: {exc}"
-            _log(f"[controller] ERROR prepare_job: {exc}")
-            if self.on_finish:
-                self.on_finish(False, self._error_msg)
+        if self._pool.is_alive():
+            log.debug("Renderer.start() called but pool is already running")
             return
 
-        job = self._job
-        _log(
-            f"[controller] Job '{job.job_id}' disiapkan: "
-            f"{job.total_segments} segmen, "
-            f"~{job.total_input_duration:.0f}s dari "
-            f"{job.video_info.duration:.0f}s video."
-        )
+        pending = self._qm.pending_count()
+        if pending == 0:
+            self._dispatch_log("⚠  No files queued — import some videos first")
+            log.warning("start() called with empty queue")
+            return
 
-        # --- Fase 2: Jalankan render ---
-        try:
-            run_job(
-                job=job,
-                log_callback=self.on_log,
-                progress_callback=self.on_progress,
-                cancel_event=self._cancel_event,
-            )
-            self._success = True
-            _log(f"[controller] Job selesai dalam {job.elapsed_sec:.1f}s.")
-            if self.on_finish:
-                self.on_finish(True, None)
+        log.info("Renderer.start() — %d job(s) pending", pending)
+        self._pool.start()
 
-        except RuntimeError as exc:
-            self._success = False
-            self._error_msg = str(exc)
-            _log(f"[controller] ERROR run_job: {exc}")
-            if self.on_finish:
-                self.on_finish(False, self._error_msg)
-
-        except Exception as exc:
-            self._success = False
-            self._error_msg = f"Error tidak terduga: {exc}"
-            _log(f"[controller] UNEXPECTED ERROR: {exc}")
-            if self.on_finish:
-                self.on_finish(False, self._error_msg)
-
-
-# ---------------------------------------------------------------------------
-# RenderControllerQt: Subklass QThread untuk integrasi PySide6 langsung
-# ---------------------------------------------------------------------------
-
-def _try_make_qt_controller() -> Optional[type]:
-    """
-    Buat kelas RenderControllerQt secara dinamis hanya jika PySide6 tersedia.
-    Kembalikan kelas atau None jika PySide6 tidak terinstall.
-    """
-    try:
-        from PySide6.QtCore import QThread, Signal, QObject   # type: ignore[import]
-    except ImportError:
-        return None
-
-    class RenderControllerQt(QThread):
+    def pause(self) -> None:
         """
-        QThread wrapper untuk RenderController.
+        Request pause after the currently running segment finishes.
 
-        Sinyal PySide6:
-          log_received(str)                  : Setiap baris log
-          progress_updated(SegmentProgress)  : Setiap tick progres
-          render_finished(bool, str)         : Selesai (sukses, pesan_error)
-
-        Cara pakai di GUI PySide6:
-        --------------------------
-            req  = RenderRequest(input_path=Path("video.mp4"))
-            ctrl = RenderControllerQt(request=req, parent=self)
-            ctrl.log_received.connect(self.append_log)
-            ctrl.progress_updated.connect(self.update_progress_bar)
-            ctrl.render_finished.connect(self.on_render_done)
-            ctrl.start()
-
-        Cara cancel:
-            ctrl.cancel()   # panggil dari thread GUI kapan saja
+        The UI state will update to PAUSED automatically once the segment
+        completes (emitted from the VideoProcessor loop).
         """
+        if not self._pool.is_alive():
+            log.debug("pause() ignored — pool not running")
+            return
+        log.info("Renderer.pause()")
+        self._pool.pause()
+        self._dispatch_log("⏸  Pause requested — finishing current segment…")
 
-        log_received     = Signal(str)
-        progress_updated = Signal(object)   # SegmentProgress (tidak bisa hint langsung)
-        render_finished  = Signal(bool, str)
+    def resume(self) -> None:
+        """Release pause hold and continue to the next segment."""
+        if not self._pool.is_alive():
+            log.debug("resume() ignored — pool not running")
+            return
+        log.info("Renderer.resume()")
+        self._pool.resume()
+        self._dispatch_log("▶  Resuming…")
 
-        def __init__(
-            self,
-            request: RenderRequest,
-            parent: Optional[QObject] = None,
-        ) -> None:
-            super().__init__(parent)
-            self.request        = request
-            self._cancel_event  = threading.Event()
-            self._job: Optional[JobSpec] = None
-            self._success: Optional[bool] = None
-            self._error_msg: Optional[str] = None
+    def stop(self) -> None:
+        """
+        Abort all processing.  The running FFmpeg process is terminated and
+        partial output is discarded.  The queue is reset to IDLE.
+        """
+        if not self._pool.is_alive():
+            # Already idle — just make sure state is correct
+            self._qm.reset()
+            self._dispatch_state(QueueState.IDLE)
+            return
+        log.info("Renderer.stop()")
+        self._dispatch_log("⏹  Stop requested…")
+        self._pool.stop()
 
-        # ------------------------------------------------------------------
-        # Properti
-        # ------------------------------------------------------------------
+    # ── Settings ────────────────────────────────────────────────────────────
 
-        @property
-        def job(self) -> Optional[JobSpec]:
-            return self._job
+    def set_preset(self, name: str) -> None:
+        self._preset_name = name
+        self._pool.set_preset(name)
+        log.info("Preset changed to '%s'", name)
 
-        @property
-        def succeeded(self) -> Optional[bool]:
-            return self._success
+    def set_subtitle_mode(self, mode: str) -> None:
+        self._subtitle_mode = mode
+        self._pool.set_subtitle_mode(mode)
+        log.info("Subtitle mode changed to '%s'", mode)
 
-        @property
-        def error_message(self) -> Optional[str]:
-            return self._error_msg
+    # ── Callback registration ───────────────────────────────────────────────
 
-        # ------------------------------------------------------------------
-        # Kontrol
-        # ------------------------------------------------------------------
+    def set_on_log(self, cb: LogCb) -> None:
+        """
+        Register a callback for log messages.
+        cb(msg: str)
+        """
+        self._on_log = cb
 
-        def cancel(self) -> None:
-            """Batalkan render yang sedang berjalan."""
-            self._cancel_event.set()
-            self.log_received.emit("[controller] Permintaan cancel dikirim...")
+    def set_on_progress(self, cb: ProgressCb) -> None:
+        """
+        Register a callback for progress updates.
+        cb(seg_num, total, seg_pct, overall_pct, fps, speed, eta)
+        """
+        self._on_progress = cb
 
-        # ------------------------------------------------------------------
-        # QThread.run() — entri titik thread Qt
-        # ------------------------------------------------------------------
+    def set_on_state_changed(self, cb: StatusCb) -> None:
+        """
+        Register a callback for queue-state changes.
+        cb(state: QueueState)
+        """
+        self._on_state = cb
 
-        def run(self) -> None:
-            req = self.request
+    # ── State introspection ─────────────────────────────────────────────────
 
-            def _log(msg: str) -> None:
-                self.log_received.emit(msg)
+    def get_state(self) -> QueueState:
+        return self._qm.state
 
-            def _on_progress(prog: SegmentProgress) -> None:
-                self.progress_updated.emit(prog)
+    def get_queue_snapshot(self):
+        """Return a QueueSnapshot for advanced UI inspection."""
+        return self._qm.snapshot()
 
-            _log(f"[controller-qt] Memulai: '{req.input_path.name}' | "
-                 f"preset='{req.preset_name}'")
+    # ── Internal dispatchers ────────────────────────────────────────────────
+    # These are the actual functions wired into ProcessorPool.
+    # They forward to whatever the frontend registered via set_on_*().
 
-            # Fase 1: prepare_job
+    def _dispatch_log(self, msg: str) -> None:
+        if self._on_log:
             try:
-                self._job = prepare_job(
-                    input_path=req.input_path,
-                    preset_name=req.preset_name,
-                    watermark_cfg=req.watermark_cfg,
-                    zoom_config=req.zoom_config,
-                    output_dir=req.output_dir,
-                    seed=req.seed,
-                )
+                self._on_log(msg)
             except Exception as exc:
-                self._success = False
-                self._error_msg = f"Gagal menyiapkan job: {exc}"
-                _log(f"[controller-qt] ERROR prepare_job: {exc}")
-                self.render_finished.emit(False, self._error_msg)
-                return
+                log.warning("log_cb raised: %s", exc)
 
-            job = self._job
-            _log(
-                f"[controller-qt] Job '{job.job_id}' disiapkan: "
-                f"{job.total_segments} segmen, "
-                f"~{job.total_input_duration:.0f}s."
-            )
-
-            # Fase 2: run_job
+    def _dispatch_progress(
+        self,
+        seg_num:     int,
+        total:       int,
+        seg_pct:     float,
+        overall_pct: float,
+        fps:         float,
+        speed:       float,
+        eta:         float,
+    ) -> None:
+        if self._on_progress:
             try:
-                run_job(
-                    job=job,
-                    log_callback=_log,
-                    progress_callback=_on_progress,
-                    cancel_event=self._cancel_event,
-                )
-                self._success = True
-                _log(f"[controller-qt] Job selesai dalam {job.elapsed_sec:.1f}s.")
-                self.render_finished.emit(True, "")
-
-            except RuntimeError as exc:
-                self._success = False
-                self._error_msg = str(exc)
-                _log(f"[controller-qt] ERROR run_job: {exc}")
-                self.render_finished.emit(False, self._error_msg)
-
+                self._on_progress(seg_num, total, seg_pct, overall_pct, fps, speed, eta)
             except Exception as exc:
-                self._success = False
-                self._error_msg = f"Error tidak terduga: {exc}"
-                _log(f"[controller-qt] UNEXPECTED ERROR: {exc}")
-                self.render_finished.emit(False, self._error_msg)
+                log.warning("progress_cb raised: %s", exc)
 
-    return RenderControllerQt
-
-
-# Ekspor kelas Qt jika tersedia, None jika tidak
-RenderControllerQt: Optional[type] = _try_make_qt_controller()
-
-
-# ---------------------------------------------------------------------------
-# Factory function — pilih implementasi terbaik secara otomatis
-# ---------------------------------------------------------------------------
-
-def create_controller(
-    request:     RenderRequest,
-    prefer_qt:   bool = True,
-    parent:      object = None,
-) -> "RenderController | RenderControllerQt":
-    """
-    Buat controller yang sesuai:
-      - Jika prefer_qt=True dan PySide6 tersedia, kembalikan RenderControllerQt.
-      - Jika tidak, kembalikan RenderController (threading.Thread biasa).
-
-    Parameter
-    ---------
-    request    : RenderRequest dari GUI.
-    prefer_qt  : Gunakan QThread jika PySide6 tersedia (default True).
-    parent     : QObject parent untuk RenderControllerQt (diabaikan jika non-Qt).
-
-    Contoh penggunaan universal:
-    ----------------------------
-        ctrl = create_controller(RenderRequest(input_path=Path("video.mp4")))
-        if hasattr(ctrl, "log_received"):
-            # PySide6 QThread
-            ctrl.log_received.connect(my_log_slot)
-            ctrl.progress_updated.connect(my_progress_slot)
-            ctrl.render_finished.connect(my_finish_slot)
-        else:
-            # threading.Thread biasa
-            ctrl.on_log      = my_log_callback
-            ctrl.on_progress = my_progress_callback
-            ctrl.on_finish   = my_finish_callback
-        ctrl.start()
-    """
-    if prefer_qt and RenderControllerQt is not None:
-        return RenderControllerQt(request=request, parent=parent)   # type: ignore[call-arg]
-    return RenderController(request=request)
-
-
-# ---------------------------------------------------------------------------
-# Utilitas: jalankan job secara blocking (untuk scripting / test)
-# ---------------------------------------------------------------------------
-
-def run_blocking(
-    request:     RenderRequest,
-    log_callback:      Optional[LogCallback]      = None,
-    progress_callback: Optional[ProgressCallback] = None,
-) -> JobSpec:
-    """
-    Jalankan job di thread saat ini (blocking).
-    Berguna untuk testing dan scripting CLI tanpa GUI.
-
-    Kembalikan JobSpec yang telah selesai.
-    Raise RuntimeError jika render gagal.
-    """
-    job = prepare_job(
-        input_path=request.input_path,
-        preset_name=request.preset_name,
-        watermark_cfg=request.watermark_cfg,
-        zoom_config=request.zoom_config,
-        output_dir=request.output_dir,
-        seed=request.seed,
-    )
-    run_job(
-        job=job,
-        log_callback=log_callback,
-        progress_callback=progress_callback,
-        cancel_event=None,
-    )
-    return job
+    def _dispatch_state(self, state: QueueState) -> None:
+        if self._on_state:
+            try:
+                self._on_state(state)
+            except Exception as exc:
+                log.warning("state_cb raised: %s", exc)

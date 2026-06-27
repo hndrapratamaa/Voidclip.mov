@@ -1,202 +1,138 @@
 """
 backend/config.py
-=================
-Konfigurasi global untuk video processing pipeline.
-Berisi path direktori, render presets, dan konfigurasi default
-watermark/zoom. Murni stateless — tidak ada database.
+─────────────────────────────────────────────────────────────────────────────
+Voidclip.mov — Central configuration & constants
+
+All tunable values live here. Frontend modules import APP_NAME, APP_VERSION,
+INPUT_DIR, OUTPUT_DIR, RENDER_PRESETS, SubtitleMode, and
+SUPPORTED_VIDEO_EXTENSIONS directly from this file.
+─────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field
+import enum
 from pathlib import Path
-from typing import Literal
 
+# ── Application identity ──────────────────────────────────────────────────
+APP_NAME    = "Voidclip.mov"
+APP_VERSION = "1.0.0"
 
-# ---------------------------------------------------------------------------
-# Direktori kerja
-# ---------------------------------------------------------------------------
+# ── Directory layout ───────────────────────────────────────────────────────
+# Resolve relative to this config file so the app works from any CWD.
+_ROOT   = Path(__file__).resolve().parent.parent   # project root
+INPUT_DIR  = _ROOT / "input"
+OUTPUT_DIR = _ROOT / "output"
+LOGS_DIR   = _ROOT / "logs"
+TEMP_DIR   = _ROOT / ".tmp"
 
-BASE_DIR: Path = Path(__file__).resolve().parent.parent
-
-# Direktori default bisa di-override lewat environment variable
-INPUT_DIR: Path  = Path(os.getenv("VOIDCLIP_INPUT",  str(BASE_DIR / "input")))
-OUTPUT_DIR: Path = Path(os.getenv("VOIDCLIP_OUTPUT", str(BASE_DIR / "output")))
-CACHE_DIR: Path  = Path(os.getenv("VOIDCLIP_CACHE",  str(BASE_DIR / "cache")))
-
-# Pastikan direktori ada saat modul dimuat
-for _d in (INPUT_DIR, OUTPUT_DIR, CACHE_DIR):
+# Ensure essential directories exist at import time
+for _d in (INPUT_DIR, OUTPUT_DIR, LOGS_DIR, TEMP_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
+# ── Video support ──────────────────────────────────────────────────────────
+SUPPORTED_VIDEO_EXTENSIONS: frozenset[str] = frozenset({
+    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".ts", ".m4v",
+})
 
-# ---------------------------------------------------------------------------
-# Konfigurasi pemotongan segmen (Intelligent Random Slicing)
-# ---------------------------------------------------------------------------
+# ── Segment slicing bounds (seconds) ──────────────────────────────────────
+SEGMENT_MIN_DURATION: int = 240   # 4 minutes
+SEGMENT_MAX_DURATION: int = 300   # 5 minutes
 
-SEGMENT_DURATION_MIN: int = 240   # detik  (4 menit)
-SEGMENT_DURATION_MAX: int = 300   # detik  (5 menit)
+# ── Canvas dimensions (9:16 vertical) ─────────────────────────────────────
+CANVAS_W: int = 1080
+CANVAS_H: int = 1920
 
+# ── Cinematic reframing zoom range (applied to foreground layer) ───────────
+ZOOM_MIN: float = 0.05   # 5 %  crop factor
+ZOOM_MAX: float = 0.10   # 10 % crop factor
 
-# ---------------------------------------------------------------------------
-# Konfigurasi canvas output (Synchronized 9:16 Vertical Layout)
-# ---------------------------------------------------------------------------
+# ── Watermark ─────────────────────────────────────────────────────────────
+WATERMARK_TEXT: str  = "Voidclip.mov"
+WATERMARK_FONT: str  = "Arial"          # must be available on host system
+WATERMARK_SIZE: int  = 42
+WATERMARK_OPACITY: float = 0.55         # 0.0 – 1.0
+WATERMARK_Y_RATIO: float = 0.88         # vertical position as fraction of canvas height
 
-CANVAS_WIDTH:  int = 1080
-CANVAS_HEIGHT: int = 1920
+# ── Background blur ───────────────────────────────────────────────────────
+BLUR_LUMA_POWER: int = 20   # boxblur luma radius
+BLUR_CHROMA_POWER: int = 10  # boxblur chroma radius (gentler to hide artefacts)
 
-# Blur background
-BLUR_LUMA_RADIUS: int = 40   # radius boxblur pada channel luma
-BLUR_CHROMA_RADIUS: int = 20  # radius boxblur pada channel chroma
-BLUR_LUMA_POWER: int = 3
-BLUR_CHROMA_POWER: int = 3
+# ── SubtitleMode enum ─────────────────────────────────────────────────────
+class SubtitleMode(str, enum.Enum):
+    KEEP    = "keep"
+    BURN    = "burn"
+    DISABLE = "disable"
 
-# Foreground: ukuran kotak highlight di tengah canvas (piksel)
-# Video asli akan di-fit-scale masuk ke dalam kotak ini
-FOREGROUND_MAX_WIDTH:  int = 1080
-FOREGROUND_MAX_HEIGHT: int = 1080   # persegi di tengah; bisa disesuaikan
-
-
-# ---------------------------------------------------------------------------
-# Anti-Copyright Zoom (crop foreground 5%–10%)
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class ZoomConfig:
-    """Konfigurasi zoom/crop foreground untuk anti-copyright detection."""
-    zoom_min_pct: float = 5.0    # persen minimum crop dari sisi frame
-    zoom_max_pct: float = 10.0   # persen maksimum crop dari sisi frame
-    # Nilai aktual dipilih acak saat job disiapkan; disimpan di JobSpec
-
-
-DEFAULT_ZOOM_CONFIG = ZoomConfig()
-
-
-# ---------------------------------------------------------------------------
-# Watermark
-# ---------------------------------------------------------------------------
-
-@dataclass
-class WatermarkConfig:
-    """Konfigurasi teks watermark via FFmpeg drawtext."""
-    text:          str   = "Voidclip.mov"
-    font_file:     str   = ""           # kosong = pakai font sistem (sans-serif)
-    font_size:     int   = 42
-    font_color:    str   = "white@0.35" # putih transparan
-    font_bold:     bool  = True
-    # Posisi: ekspresi FFmpeg — default: tengah horizontal, 92% dari bawah
-    x_expr:        str   = "(w-text_w)/2"
-    y_expr:        str   = "h*0.92"
-    # Shadow tipis agar terbaca di latar apapun
-    shadow_color:  str   = "black@0.25"
-    shadow_x:      int   = 2
-    shadow_y:      int   = 2
-    box_enabled:   bool  = False
-    box_color:     str   = "black@0.20"
-    box_border_w:  int   = 12
-
-
-DEFAULT_WATERMARK_CONFIG = WatermarkConfig()
-
-
-# ---------------------------------------------------------------------------
-# Render Presets
-# ---------------------------------------------------------------------------
-
-VideoCodec  = Literal["libx264", "libx265", "h264_nvenc", "hevc_nvenc",
-                       "h264_videotoolbox", "hevc_videotoolbox",
-                       "h264_amf", "hevc_amf"]
-AudioCodec  = Literal["aac", "copy"]
-PixelFormat = Literal["yuv420p", "yuv444p", "p010le"]
-
-
-@dataclass
-class RenderPreset:
-    """Satu konfigurasi encode untuk output akhir."""
-    name:          str
-    video_codec:   VideoCodec   = "libx264"
-    audio_codec:   AudioCodec   = "aac"
-    crf:           int          = 23          # 0–51; lebih rendah = lebih bagus
-    preset:        str          = "medium"    # ultrafast…veryslow
-    pixel_format:  PixelFormat  = "yuv420p"
-    audio_bitrate: str          = "192k"
-    # Thread: 0 = auto (FFmpeg pilih sendiri)
-    threads:       int          = 0
-    # Extra FFmpeg output flags, list of str pasangan [-flag, value]
-    extra_flags:   list[str]    = field(default_factory=list)
-
-
-RENDER_PRESETS: dict[str, RenderPreset] = {
-    "draft": RenderPreset(
-        name="draft",
-        video_codec="libx264",
-        crf=28,
-        preset="ultrafast",
-        audio_bitrate="128k",
-    ),
-    "standard": RenderPreset(
-        name="standard",
-        video_codec="libx264",
-        crf=23,
-        preset="medium",
-        audio_bitrate="192k",
-    ),
-    "high_quality": RenderPreset(
-        name="high_quality",
-        video_codec="libx264",
-        crf=18,
-        preset="slow",
-        audio_bitrate="320k",
-    ),
-    "nvenc_fast": RenderPreset(
-        name="nvenc_fast",
-        video_codec="h264_nvenc",
-        crf=0,                  # nvenc pakai -b:v atau -cq
-        preset="p4",
-        pixel_format="yuv420p",
-        audio_bitrate="192k",
-        extra_flags=["-cq", "23", "-b:v", "0"],
-    ),
-    "hevc_quality": RenderPreset(
-        name="hevc_quality",
-        video_codec="libx265",
-        crf=22,
-        preset="medium",
-        pixel_format="yuv420p",
-        audio_bitrate="192k",
-        extra_flags=["-tag:v", "hvc1"],
-    ),
+# ── Render presets ─────────────────────────────────────────────────────────
+# Each preset maps to an ffmpeg encoding argument dict.
+# Keys: video_codec, crf, preset, audio_codec, audio_bitrate, pixel_format,
+#       extra_vargs (list of extra video stream args), container
+RENDER_PRESETS: dict[str, dict] = {
+    "H264 — Fast (CRF 23)": {
+        "video_codec":   "libx264",
+        "crf":           23,
+        "preset":        "fast",
+        "audio_codec":   "aac",
+        "audio_bitrate": "192k",
+        "pixel_format":  "yuv420p",
+        "extra_vargs":   ["-movflags", "+faststart"],
+        "container":     "mp4",
+    },
+    "H264 — Quality (CRF 18)": {
+        "video_codec":   "libx264",
+        "crf":           18,
+        "preset":        "slow",
+        "audio_codec":   "aac",
+        "audio_bitrate": "256k",
+        "pixel_format":  "yuv420p",
+        "extra_vargs":   ["-movflags", "+faststart"],
+        "container":     "mp4",
+    },
+    "H265 — Efficient (CRF 24)": {
+        "video_codec":   "libx265",
+        "crf":           24,
+        "preset":        "medium",
+        "audio_codec":   "aac",
+        "audio_bitrate": "192k",
+        "pixel_format":  "yuv420p10le",
+        "extra_vargs":   ["-tag:v", "hvc1"],
+        "container":     "mp4",
+    },
+    "H265 — Quality (CRF 20)": {
+        "video_codec":   "libx265",
+        "crf":           20,
+        "preset":        "slow",
+        "audio_codec":   "aac",
+        "audio_bitrate": "256k",
+        "pixel_format":  "yuv420p10le",
+        "extra_vargs":   ["-tag:v", "hvc1"],
+        "container":     "mp4",
+    },
+    "VP9 — Web (CQ 30)": {
+        "video_codec":   "libvpx-vp9",
+        "crf":           30,
+        "preset":        None,          # VP9 uses -quality instead
+        "audio_codec":   "libopus",
+        "audio_bitrate": "192k",
+        "pixel_format":  "yuv420p",
+        "extra_vargs":   ["-b:v", "0", "-quality", "good", "-cpu-used", "2"],
+        "container":     "webm",
+    },
 }
 
-DEFAULT_PRESET_NAME: str = "standard"
+# Default active preset name — must be a key in RENDER_PRESETS
+DEFAULT_PRESET: str = "H264 — Fast (CRF 23)"
+DEFAULT_SUBTITLE_MODE: SubtitleMode = SubtitleMode.KEEP
 
+# ── FFmpeg probe / binary ──────────────────────────────────────────────────
+# Set to None to let the engine search PATH automatically.
+FFMPEG_BIN:  str | None = None   # e.g. "/usr/local/bin/ffmpeg"
+FFPROBE_BIN: str | None = None   # e.g. "/usr/local/bin/ffprobe"
 
-# ---------------------------------------------------------------------------
-# Hardware acceleration hints
-# ---------------------------------------------------------------------------
+# ── Template store ─────────────────────────────────────────────────────────
+TEMPLATES_FILE: Path = _ROOT / "backend" / "templates.json"
 
-@dataclass(frozen=True)
-class HWAccelConfig:
-    """
-    Petunjuk hardware acceleration.
-    Dideteksi secara runtime oleh ffmpeg_engine; flag di sini hanya default.
-    """
-    try_nvenc:        bool = True
-    try_videotoolbox: bool = True
-    try_amf:          bool = True
-    # Fallback ke software jika semua HW gagal
-    fallback_software: bool = True
-
-
-DEFAULT_HWACCEL_CONFIG = HWAccelConfig()
-
-
-# ---------------------------------------------------------------------------
-# Batas progres & polling
-# ---------------------------------------------------------------------------
-
-# Interval baca stderr FFmpeg (detik) untuk parsing progress
-FFMPEG_PROGRESS_POLL_INTERVAL: float = 0.25
-
-# Timeout (detik) menunggu FFmpeg merespons sebelum dianggap hang
-FFMPEG_HANG_TIMEOUT: float = 120.0
+# ── Progress reporting ─────────────────────────────────────────────────────
+# Minimum seconds between progress callback emissions to avoid GUI flooding.
+PROGRESS_THROTTLE_S: float = 0.25

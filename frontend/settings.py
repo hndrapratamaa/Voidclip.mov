@@ -1,10 +1,12 @@
 from __future__ import annotations
+
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox,
     QFormLayout, QGroupBox, QVBoxLayout,
 )
-from backend import database as db
+
 from backend.config import RENDER_PRESETS, SubtitleMode
+from backend.lang_id import BTN_BUNGKUS, BTN_BATAL
 from backend.renderer import Renderer
 
 
@@ -12,14 +14,14 @@ class SettingsDialog(QDialog):
     def __init__(self, renderer: Renderer, parent=None) -> None:
         super().__init__(parent)
         self.renderer = renderer
-        self.setWindowTitle("Settings")
+        self.setWindowTitle("Setelan Render blay")
         self.setMinimumWidth(440)
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
 
-        grp = QGroupBox("Render Preset")
+        grp = QGroupBox("Preset Render")
         pf = QFormLayout(grp)
 
         self.cb_preset = QComboBox()
@@ -28,11 +30,14 @@ class SettingsDialog(QDialog):
 
         self.cb_subtitle = QComboBox()
         self.cb_subtitle.addItems(["keep", "burn", "disable"])
-        pf.addRow("Subtitle Mode:", self.cb_subtitle)
+        pf.addRow("Mode Subtitle:", self.cb_subtitle)
 
         layout.addWidget(grp)
 
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
         btns.accepted.connect(self._apply)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)

@@ -1,702 +1,573 @@
 """
 backend/ffmpeg_engine.py
-========================
-Lapisan rendah yang berkomunikasi langsung dengan binary FFmpeg/FFprobe.
+─────────────────────────────────────────────────────────────────────────────
+Voidclip.mov — FFmpeg engine: probe, segment planning, filtergraph, encode
 
-Tanggung jawab:
-  - Menemukan binary ffmpeg dan ffprobe di sistem.
-  - Mengambil metadata video (durasi, resolusi, fps, codec) via ffprobe.
-  - Menyusun dan mengeksekusi perintah FFmpeg untuk satu segmen,
-    termasuk filtergraph kompleks:
-      * Blur background (9:16 vertical canvas)
-      * Foreground highlight tersinkronisasi
-      * Anti-copyright zoom/crop
-      * Watermark teks drawtext
-  - Mem-parse output stderr FFmpeg secara real-time untuk laporan progres.
-  - Mendukung hardware acceleration (NVENC / VideoToolbox / AMF) dengan
-    fallback otomatis ke software encode.
+Responsibilities
+────────────────
+1. `probe_video`        — extract duration, width, height, fps via ffprobe
+2. `plan_segments`      — deterministic random slice plan (240–300 s each)
+3. `build_filtergraph`  — assemble the 9:16 complex filtergraph string
+4. `stream_copy_cut`    — fast lossless trim to a temp file (pre-encode step)
+5. `encode_segment`     — full quality encode of a trimmed temp segment
+
+Filtergraph pipeline (per segment)
+────────────────────────────────────
+[0:v] ──► scale to 1080×1920 (fill, crop overflow)
+       ──► boxblur(20) ─────────────────────────────────────► [bg]
+[0:v] ──► scale to fit inside 1080×(1920-margin) with zoom  ► [fg]
+[bg][fg] overlay=centred ──► drawtext watermark ────────────► [out]
+[0:a] ──────────────────────────────────────────────────────► [aout]
+─────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
+import random
 import re
 import shutil
 import subprocess
-import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, List, Optional, Tuple
 
 from backend.config import (
     BLUR_CHROMA_POWER,
-    BLUR_CHROMA_RADIUS,
     BLUR_LUMA_POWER,
-    BLUR_LUMA_RADIUS,
-    CANVAS_HEIGHT,
-    CANVAS_WIDTH,
-    DEFAULT_HWACCEL_CONFIG,
-    DEFAULT_WATERMARK_CONFIG,
-    FFMPEG_HANG_TIMEOUT,
-    FOREGROUND_MAX_HEIGHT,
-    FOREGROUND_MAX_WIDTH,
-    HWAccelConfig,
-    RenderPreset,
-    WatermarkConfig,
+    CANVAS_H,
+    CANVAS_W,
+    FFMPEG_BIN,
+    FFPROBE_BIN,
+    SEGMENT_MAX_DURATION,
+    SEGMENT_MIN_DURATION,
+    TEMP_DIR,
+    WATERMARK_FONT,
+    WATERMARK_OPACITY,
+    WATERMARK_SIZE,
+    WATERMARK_TEXT,
+    WATERMARK_Y_RATIO,
+    ZOOM_MAX,
+    ZOOM_MIN,
 )
+from backend.logger import get_logger
+
+log = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Tipe callback
-# ---------------------------------------------------------------------------
+# ── Binary resolution ───────────────────────────────────────────────────────
 
-LogCallback      = Callable[[str], None]
-ProgressCallback = Callable[[float], None]   # 0.0–100.0, progres segmen ini
-
-
-# ---------------------------------------------------------------------------
-# Dataclass hasil probe
-# ---------------------------------------------------------------------------
-
-@dataclass
-class VideoInfo:
-    """Metadata video dari ffprobe."""
-    path:       Path
-    duration:   float          # detik (float)
-    width:      int
-    height:     int
-    fps:        float
-    video_codec: str
-    audio_codec: str
-    has_audio:  bool
-
-
-# ---------------------------------------------------------------------------
-# Pencarian binary
-# ---------------------------------------------------------------------------
-
-def _search_binary(name: str) -> Optional[str]:
-    """
-    Cari binary di PATH, lalu di lokasi umum Windows/macOS/Linux.
-    Kembalikan path absolut atau None jika tidak ditemukan.
-    """
+def _resolve_bin(override: Optional[str], name: str) -> str:
+    if override:
+        return override
     found = shutil.which(name)
     if found:
         return found
-
-    # Lokasi alternatif umum
-    candidates: list[str] = []
-    if os.name == "nt":
-        candidates = [
-            rf"C:\ffmpeg\bin\{name}.exe",
-            rf"C:\Program Files\ffmpeg\bin\{name}.exe",
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "ffmpeg", "bin", f"{name}.exe"),
-        ]
-    else:
-        candidates = [
-            f"/usr/local/bin/{name}",
-            f"/usr/bin/{name}",
-            f"/opt/homebrew/bin/{name}",
-            f"/opt/local/bin/{name}",
-            os.path.expanduser(f"~/bin/{name}"),
-            os.path.expanduser(f"~/.local/bin/{name}"),
-        ]
-
-    for path in candidates:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-
-    return None
+    raise FileNotFoundError(
+        f"'{name}' not found on PATH. Install FFmpeg or set {name.upper()}_BIN in config.py"
+    )
 
 
-def find_ffmpeg() -> str:
+def ffmpeg_bin() -> str:
+    return _resolve_bin(FFMPEG_BIN, "ffmpeg")
+
+
+def ffprobe_bin() -> str:
+    return _resolve_bin(FFPROBE_BIN, "ffprobe")
+
+
+# ── Probe result ────────────────────────────────────────────────────────────
+
+@dataclass
+class VideoInfo:
+    path:       Path
+    duration:   float          # seconds
+    width:      int
+    height:     int
+    fps:        float
+    has_audio:  bool = True
+    codec:      str  = "unknown"
+
+    @property
+    def aspect(self) -> float:
+        return self.width / max(self.height, 1)
+
+    @property
+    def is_landscape(self) -> bool:
+        return self.width >= self.height
+
+
+# ── Segment descriptor ──────────────────────────────────────────────────────
+
+@dataclass
+class SegmentPlan:
+    index:      int
+    start:      float   # seconds into the source
+    duration:   float   # requested duration (may be shorter at end of file)
+    zoom:       float   # cinematic zoom factor for this segment
+
+
+# ── 1. Probe ────────────────────────────────────────────────────────────────
+
+def probe_video(path: Path) -> VideoInfo:
     """
-    Kembalikan path binary ffmpeg.
-    Raise FileNotFoundError jika tidak ditemukan.
+    Run ffprobe and return a VideoInfo.  Raises RuntimeError on failure.
     """
-    path = _search_binary("ffmpeg")
-    if not path:
-        raise FileNotFoundError(
-            "Binary 'ffmpeg' tidak ditemukan. "
-            "Pastikan FFmpeg terinstall dan tersedia di PATH."
-        )
-    return path
-
-
-def find_ffprobe() -> str:
-    """
-    Kembalikan path binary ffprobe.
-    Raise FileNotFoundError jika tidak ditemukan.
-    """
-    path = _search_binary("ffprobe")
-    if not path:
-        raise FileNotFoundError(
-            "Binary 'ffprobe' tidak ditemukan. "
-            "Pastikan FFmpeg (termasuk ffprobe) terinstall dan tersedia di PATH."
-        )
-    return path
-
-
-# ---------------------------------------------------------------------------
-# Probe video
-# ---------------------------------------------------------------------------
-
-def probe_video(video_path: Path) -> VideoInfo:
-    """
-    Ambil metadata video menggunakan ffprobe.
-    Kembalikan VideoInfo.
-    Raise RuntimeError jika file tidak valid atau ffprobe gagal.
-    """
-    ffprobe = find_ffprobe()
-
     cmd = [
-        ffprobe,
+        ffprobe_bin(),
         "-v", "quiet",
         "-print_format", "json",
         "-show_streams",
         "-show_format",
-        str(video_path),
+        str(path),
     ]
-
+    log.debug("ffprobe: %s", " ".join(cmd))
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=30,
+            check=True,
         )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"ffprobe failed on {path.name}: {exc.stderr.strip()}") from exc
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"ffprobe timeout saat membaca: {video_path}") from exc
-    except FileNotFoundError as exc:
-        raise RuntimeError("ffprobe binary tidak ditemukan.") from exc
+        raise RuntimeError(f"ffprobe timed out on {path.name}") from exc
 
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"ffprobe gagal (kode {result.returncode}):\n{result.stderr}"
-        )
+    data = json.loads(result.stdout)
 
+    # ── Extract video stream ───────────────────────────────────────────────
+    video_stream = next(
+        (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
+        None,
+    )
+    if video_stream is None:
+        raise RuntimeError(f"No video stream found in {path.name}")
+
+    audio_stream = next(
+        (s for s in data.get("streams", []) if s.get("codec_type") == "audio"),
+        None,
+    )
+
+    # Duration: prefer format-level, fall back to stream-level
+    raw_duration = (
+        data.get("format", {}).get("duration")
+        or video_stream.get("duration")
+        or "0"
+    )
+    duration = float(raw_duration)
+
+    # FPS: avg_frame_rate is a fraction string like "30000/1001"
+    fps_str = video_stream.get("avg_frame_rate", "30/1")
     try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Output ffprobe bukan JSON valid:\n{result.stdout}") from exc
+        num, den = fps_str.split("/")
+        fps = float(num) / float(den) if float(den) != 0 else 30.0
+    except (ValueError, ZeroDivisionError):
+        fps = 30.0
 
-    streams = data.get("streams", [])
-    fmt     = data.get("format", {})
+    codec = video_stream.get("codec_name", "unknown")
+    w     = int(video_stream.get("width", 1920))
+    h     = int(video_stream.get("height", 1080))
 
-    # Ambil durasi dari format terlebih dahulu, fallback ke stream
-    duration_str = fmt.get("duration", "0")
-    try:
-        duration = float(duration_str)
-    except ValueError:
-        duration = 0.0
-
-    width  = 0
-    height = 0
-    fps    = 0.0
-    video_codec = "unknown"
-    audio_codec = "unknown"
-    has_audio   = False
-
-    for stream in streams:
-        codec_type = stream.get("codec_type", "")
-
-        if codec_type == "video" and width == 0:
-            width  = int(stream.get("width",  0))
-            height = int(stream.get("height", 0))
-            video_codec = stream.get("codec_name", "unknown")
-
-            # Hitung fps dari r_frame_rate atau avg_frame_rate
-            for fps_key in ("r_frame_rate", "avg_frame_rate"):
-                fps_str = stream.get(fps_key, "")
-                if fps_str and fps_str not in ("0/0", "0"):
-                    try:
-                        num, den = fps_str.split("/")
-                        _fps = float(num) / float(den)
-                        if _fps > 0:
-                            fps = _fps
-                            break
-                    except (ValueError, ZeroDivisionError):
-                        pass
-
-            # Durasi stream lebih akurat untuk beberapa container
-            if duration == 0.0:
-                try:
-                    duration = float(stream.get("duration", "0"))
-                except ValueError:
-                    pass
-
-        elif codec_type == "audio":
-            has_audio   = True
-            audio_codec = stream.get("codec_name", "unknown")
-
-    if duration <= 0:
-        raise RuntimeError(
-            f"Durasi video tidak dapat dibaca atau nol: {video_path}"
-        )
-    if width <= 0 or height <= 0:
-        raise RuntimeError(
-            f"Resolusi video tidak valid ({width}x{height}): {video_path}"
-        )
-
-    return VideoInfo(
-        path=video_path,
+    info = VideoInfo(
+        path=path,
         duration=duration,
-        width=width,
-        height=height,
-        fps=fps if fps > 0 else 25.0,
-        video_codec=video_codec,
-        audio_codec=audio_codec,
-        has_audio=has_audio,
+        width=w,
+        height=h,
+        fps=fps,
+        has_audio=audio_stream is not None,
+        codec=codec,
     )
-
-
-# ---------------------------------------------------------------------------
-# Deteksi hardware acceleration
-# ---------------------------------------------------------------------------
-
-def _test_hw_encoder(codec: str) -> bool:
-    """
-    Uji apakah encoder HW tersedia dengan encoding frame dummy.
-    Kembalikan True jika berhasil.
-    """
-    try:
-        ffmpeg = find_ffmpeg()
-    except FileNotFoundError:
-        return False
-
-    cmd = [
-        ffmpeg,
-        "-loglevel", "error",
-        "-f", "lavfi", "-i", "nullsrc=s=128x128:d=0.1",
-        "-c:v", codec,
-        "-frames:v", "1",
-        "-f", "null",
-        "-",
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, timeout=15)
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, Exception):
-        return False
-
-
-def detect_available_hwaccel(cfg: HWAccelConfig = DEFAULT_HWACCEL_CONFIG) -> Optional[str]:
-    """
-    Uji hardware encoder satu per satu berdasarkan konfigurasi.
-    Kembalikan nama encoder HW pertama yang berhasil, atau None (software).
-    """
-    candidates: list[tuple[bool, str]] = []
-
-    if cfg.try_nvenc:
-        candidates.append((True, "h264_nvenc"))
-    if cfg.try_videotoolbox:
-        candidates.append((True, "h264_videotoolbox"))
-    if cfg.try_amf:
-        candidates.append((True, "h264_amf"))
-
-    for _enabled, codec in candidates:
-        if _enabled and _test_hw_encoder(codec):
-            return codec
-
-    return None   # fallback ke software
-
-
-# ---------------------------------------------------------------------------
-# Penyusun filtergraph
-# ---------------------------------------------------------------------------
-
-def _build_filtergraph(
-    src_width:        int,
-    src_height:       int,
-    zoom_crop_pct:    float,
-    watermark_cfg:    WatermarkConfig,
-) -> str:
-    """
-    Susun string filtergraph FFmpeg lengkap untuk satu pass render.
-
-    Stream input diasumsikan:
-      [0:v]  = stream video dari sumber
-      [0:a]  = stream audio dari sumber (jika ada)
-
-    Urutan filter:
-      1. Split input video menjadi dua cabang: bg (background) dan fg (foreground).
-      2. Background path:
-         a. Scale ke canvas penuh (cover, aspect ratio dipertahankan dengan crop).
-         b. Blur lebih (boxblur).
-      3. Foreground path:
-         a. Hitung ukuran setelah zoom/crop anti-copyright.
-         b. Scale ke FOREGROUND_MAX_WIDTH x FOREGROUND_MAX_HEIGHT (fit/pad).
-         c. Overlay di tengah canvas background.
-      4. Watermark drawtext di atas hasil overlay.
-
-    Kembalikan string filter_complex.
-    """
-    canvas_w = CANVAS_WIDTH
-    canvas_h = CANVAS_HEIGHT
-    fg_max_w = FOREGROUND_MAX_WIDTH
-    fg_max_h = FOREGROUND_MAX_HEIGHT
-
-    # --- Hitung faktor zoom/crop ---
-    # zoom_crop_pct = persentase yang di-crop dari SETIAP sisi
-    # Misal 7% -> crop 7% dari kiri, 7% dari kanan, 7% atas, 7% bawah
-    # Resulting crop area = (100 - 2*pct)% dari dimensi asli
-    crop_factor = 1.0 - (zoom_crop_pct / 100.0) * 2
-    crop_factor = max(0.70, min(1.0, crop_factor))   # clamp 70%–100%
-
-    # Ukuran crop area dalam piksel (berdasarkan dimensi sumber)
-    crop_w_expr = f"trunc(iw*{crop_factor:.6f}/2)*2"
-    crop_h_expr = f"trunc(ih*{crop_factor:.6f}/2)*2"
-    # Offset agar crop terpusat
-    crop_x_expr = f"(iw-{crop_w_expr})/2"
-    crop_y_expr = f"(ih-{crop_h_expr})/2"
-
-    # --- Background: scale cover 9:16 lalu blur ---
-    # Scale agar memenuhi canvas dari sisi terpendek (cover behavior):
-    # Gunakan scale2ref atau scale dengan force_original_aspect_ratio=increase lalu crop
-    bg_scale = (
-        f"scale={canvas_w}:{canvas_h}"
-        f":force_original_aspect_ratio=increase"
-        f":flags=lanczos"
+    log.info(
+        "Probed '%s': %.1fs, %dx%d, %.2f fps, audio=%s, codec=%s",
+        path.name, duration, w, h, fps, info.has_audio, codec,
     )
-    bg_crop  = f"crop={canvas_w}:{canvas_h}"
-    bg_blur  = (
-        f"boxblur="
-        f"luma_radius={BLUR_LUMA_RADIUS}:luma_power={BLUR_LUMA_POWER}"
-        f":chroma_radius={BLUR_CHROMA_RADIUS}:chroma_power={BLUR_CHROMA_POWER}"
-    )
+    return info
 
-    # --- Foreground: crop anti-copyright -> scale fit ke kotak tengah ---
-    fg_crop   = f"crop={crop_w_expr}:{crop_h_expr}:{crop_x_expr}:{crop_y_expr}"
-    fg_scale  = (
-        f"scale={fg_max_w}:{fg_max_h}"
-        f":force_original_aspect_ratio=decrease"
-        f":flags=lanczos"
-    )
-    # Pad agar ukuran persis fg_max_w x fg_max_h (letterbox transparan -> hitam)
-    fg_pad    = (
-        f"pad={fg_max_w}:{fg_max_h}"
-        f":(ow-iw)/2:(oh-ih)/2"
-        f":color=black"
-    )
 
-    # Posisi overlay foreground di tengah canvas
-    overlay_x = f"({canvas_w}-{fg_max_w})/2"
-    overlay_y = f"({canvas_h}-{fg_max_h})/2"
+# ── 2. Segment planning ─────────────────────────────────────────────────────
 
-    # --- Watermark drawtext ---
-    wm = watermark_cfg
-    font_part   = f"fontfile='{wm.font_file}'" if wm.font_file else "font='Sans'"
-    bold_part   = ":style='Bold'" if wm.font_bold and not wm.font_file else ""
-    shadow_part = (
-        f":shadowcolor={wm.shadow_color}"
-        f":shadowx={wm.shadow_x}"
-        f":shadowy={wm.shadow_y}"
-    )
-    box_part = ""
-    if wm.box_enabled:
-        box_part = (
-            f":box=1"
-            f":boxcolor={wm.box_color}"
-            f":boxborderw={wm.box_border_w}"
+def plan_segments(
+    info: VideoInfo,
+    seed: Optional[int] = None,
+) -> List[SegmentPlan]:
+    """
+    Divide the video into segments of random duration between
+    SEGMENT_MIN_DURATION and SEGMENT_MAX_DURATION seconds.
+
+    The last segment is always included even if shorter than the minimum.
+
+    Each segment also gets a randomly sampled cinematic zoom factor.
+    """
+    rng = random.Random(seed)   # seeded for reproducibility if needed
+    segments: List[SegmentPlan] = []
+    cursor = 0.0
+    idx    = 0
+
+    while cursor < info.duration:
+        raw_dur = rng.uniform(SEGMENT_MIN_DURATION, SEGMENT_MAX_DURATION)
+        actual_dur = min(raw_dur, info.duration - cursor)
+
+        if actual_dur < 10.0:
+            # Tail too short to be useful — skip
+            log.debug("Skipping tail segment of %.1f s at %.1f s", actual_dur, cursor)
+            break
+
+        zoom = rng.uniform(ZOOM_MIN, ZOOM_MAX)
+
+        segments.append(
+            SegmentPlan(
+                index=idx,
+                start=cursor,
+                duration=actual_dur,
+                zoom=zoom,
+            )
         )
+        cursor += actual_dur
+        idx    += 1
 
-    # Escape teks watermark untuk drawtext (apostrof dan backslash)
-    safe_text = wm.text.replace("\\", "\\\\").replace("'", "\\'")
+    log.info("Planned %d segments for '%s'", len(segments), info.path.name)
+    return segments
 
-    drawtext = (
+
+# ── 3. Complex filtergraph builder ──────────────────────────────────────────
+
+def build_filtergraph(info: VideoInfo, seg: SegmentPlan) -> str:
+    """
+    Return the -filter_complex string for the 9:16 vertical canvas.
+
+    Pipeline
+    ────────
+    Step A — Background layer
+        Scale input so it *fills* the full 1080×1920 canvas (cover mode),
+        then apply heavy boxblur.
+
+    Step B — Foreground layer
+        Scale input to maximally fit *within* a safe inner width/height,
+        apply the per-segment cinematic zoom/crop, center-crop to the
+        exact foreground dimensions.
+
+    Step C — Composite
+        Overlay foreground centred on blurred background.
+
+    Step D — Watermark
+        drawtext at bottom-centre with configurable opacity.
+    """
+    cw, ch = CANVAS_W, CANVAS_H          # 1080 × 1920
+    src_w,  src_h  = info.width, info.height
+
+    # ── Step A: background scale (cover fill 1080×1920) ───────────────────
+    # The scale filter uses 'force_original_aspect_ratio=increase' to ensure
+    # the frame covers the full canvas, then we centrecrop any overflow.
+    bg_scale = (
+        f"scale={cw}:{ch}:force_original_aspect_ratio=increase,"
+        f"crop={cw}:{ch}"
+    )
+    bg_blur = (
+        f"boxblur=luma_radius={BLUR_LUMA_POWER}:luma_power=1"
+        f":chroma_radius={BLUR_CHROMA_POWER}:chroma_power=1"
+    )
+
+    # ── Step B: foreground dimensions with zoom ────────────────────────────
+    # The foreground fits inside the canvas width while preserving aspect.
+    # zoom factor crops INTO the frame (removes outer margin).
+    zoom = seg.zoom  # e.g. 0.07 → 7% crop on each axis
+
+    # Maximum foreground height is the full canvas height (we allow vertical fill)
+    # We scale the source so width == CANVAS_W, then take a centred crop.
+    # For landscape source (common case): fit by width first.
+    if src_w > 0 and src_h > 0:
+        # Scale to fit canvas width exactly
+        scale_h = int(round(src_h * cw / src_w))
+        fg_scale_w = cw
+        fg_scale_h = scale_h if scale_h > 0 else ch
+
+        # Apply zoom: crop (1-zoom) of each dimension from centre
+        crop_factor = 1.0 - zoom
+        fg_crop_w = int(round(fg_scale_w * crop_factor))
+        fg_crop_h = int(round(fg_scale_h * crop_factor))
+
+        # Clamp to canvas bounds
+        fg_crop_w = min(fg_crop_w, cw)
+        fg_crop_h = min(fg_crop_h, ch)
+    else:
+        fg_scale_w, fg_scale_h = cw, ch
+        fg_crop_w,  fg_crop_h  = cw, ch
+
+    fg_scale = f"scale={fg_scale_w}:{fg_scale_h}"
+    # crop=w:h:x:y  — centred crop
+    fg_crop  = f"crop={fg_crop_w}:{fg_crop_h}"
+
+    # ── Overlay position: centre on canvas ────────────────────────────────
+    overlay_x = f"(main_w-overlay_w)/2"
+    overlay_y = f"(main_h-overlay_h)/2"
+
+    # ── Step D: watermark ─────────────────────────────────────────────────
+    wm_y = int(ch * WATERMARK_Y_RATIO)
+    # alpha as hex: 0.55 → 0x8C
+    alpha_hex = format(int(WATERMARK_OPACITY * 255), "02X")
+    wm_color  = f"white@{WATERMARK_OPACITY:.2f}"
+
+    # Escape special characters in watermark text for FFmpeg drawtext
+    wm_text = WATERMARK_TEXT.replace("'", r"\'").replace(":", r"\:")
+
+    # Font file: try to use system font; drawtext can fall back to built-in.
+    # We do NOT hard-code a path — let ffmpeg resolve the font by family name.
+    watermark_filter = (
         f"drawtext="
-        f"{font_part}"
-        f":text='{safe_text}'"
-        f":fontsize={wm.font_size}"
-        f":fontcolor={wm.font_color}"
-        f"{bold_part}"
-        f":x={wm.x_expr}"
-        f":y={wm.y_expr}"
-        f"{shadow_part}"
-        f"{box_part}"
+        f"text='{wm_text}':"
+        f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+        f"fontsize={WATERMARK_SIZE}:"
+        f"fontcolor={wm_color}:"
+        f"x=(w-text_w)/2:"
+        f"y={wm_y}:"
+        f"shadowcolor=black@0.40:"
+        f"shadowx=2:shadowy=2"
     )
 
-    # --- Susun filter_complex lengkap ---
-    # Gunakan label stream bernama agar mudah dibaca
+    # ── Assemble filter_complex ────────────────────────────────────────────
     filtergraph = (
-        # Cabangkan input video menjadi dua
-        f"[0:v]split=2[bg_raw][fg_raw];"
-
-        # Background pipeline
-        f"[bg_raw]{bg_scale},{bg_crop},{bg_blur}[bg_blurred];"
-
-        # Foreground pipeline
-        f"[fg_raw]{fg_crop},{fg_scale},{fg_pad}[fg_ready];"
-
-        # Overlay foreground di atas background
-        f"[bg_blurred][fg_ready]overlay={overlay_x}:{overlay_y}[composite];"
-
-        # Tambahkan watermark
-        f"[composite]{drawtext}[vout]"
+        # Background: scale → blur → [bg]
+        f"[0:v]{bg_scale},{bg_blur}[bg];"
+        # Foreground: scale → zoom-crop → [fg]
+        f"[0:v]{fg_scale},{fg_crop}[fg];"
+        # Composite: bg + fg → watermark → [vout]
+        f"[bg][fg]overlay={overlay_x}:{overlay_y},"
+        f"{watermark_filter}[vout]"
     )
 
+    log.debug(
+        "Filtergraph built for segment %d (zoom=%.2f%%): fg=%dx%d → crop=%dx%d",
+        seg.index, zoom * 100, fg_scale_w, fg_scale_h, fg_crop_w, fg_crop_h,
+    )
     return filtergraph
 
 
-# ---------------------------------------------------------------------------
-# Parser progres FFmpeg dari stderr
-# ---------------------------------------------------------------------------
+# ── 4. Stream-copy cut (fast pre-cut) ──────────────────────────────────────
 
-# Contoh baris stderr FFmpeg:
-#   frame=  123 fps= 45 q=28.0 size=    1024kB time=00:00:04.92 bitrate=1705.5kbits/s speed=1.80x
-_PROGRESS_RE = re.compile(
-    r"frame=\s*(?P<frame>\d+)"
-    r".*?fps=\s*(?P<fps>[0-9.]+)"
-    r".*?time=(?P<time>\d{2}:\d{2}:\d{2}[.,]\d+)"
-    r".*?speed=\s*(?P<speed>[0-9.]+)x",
-    re.IGNORECASE,
-)
-
-
-def _parse_time_to_seconds(time_str: str) -> float:
-    """Konversi string 'HH:MM:SS.ms' ke detik float."""
-    time_str = time_str.replace(",", ".")
-    parts = time_str.split(":")
-    try:
-        h, m, s = float(parts[0]), float(parts[1]), float(parts[2])
-        return h * 3600 + m * 60 + s
-    except (IndexError, ValueError):
-        return 0.0
-
-
-def _parse_progress_line(line: str) -> Optional[dict]:
+def stream_copy_cut(
+    source: Path,
+    seg:    SegmentPlan,
+    tmp_dir: Path = TEMP_DIR,
+) -> Path:
     """
-    Parse satu baris stderr FFmpeg.
-    Kembalikan dict {frame, fps, elapsed_sec, speed} atau None.
+    Perform a fast stream-copy trim of the source video.
+
+    This creates a lossless temporary file containing only the segment's
+    time window.  The encode step then operates on this shorter file,
+    which is faster (no need for ffmpeg to seek through the whole source
+    on every frame).
+
+    Returns the path to the trimmed temp file.
     """
-    match = _PROGRESS_RE.search(line)
-    if not match:
-        return None
-    try:
-        return {
-            "frame":       int(match.group("frame")),
-            "fps":         float(match.group("fps")),
-            "elapsed_sec": _parse_time_to_seconds(match.group("time")),
-            "speed":       float(match.group("speed")),
-        }
-    except (ValueError, AttributeError):
-        return None
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{source.stem}_seg{seg.index:04d}_cut"
+    tmp_path = tmp_dir / f"{stem}.mkv"   # MKV tolerates stream-copy better
 
-
-# ---------------------------------------------------------------------------
-# Fungsi inti: render_segment
-# ---------------------------------------------------------------------------
-
-def render_segment(
-    input_path:        Path,
-    output_path:       Path,
-    start_sec:         float,
-    duration_sec:      float,
-    zoom_crop_pct:     float,
-    preset:            RenderPreset,
-    watermark_cfg:     WatermarkConfig         = DEFAULT_WATERMARK_CONFIG,
-    hwaccel_cfg:       HWAccelConfig           = DEFAULT_HWACCEL_CONFIG,
-    log_callback:      Optional[LogCallback]   = None,
-    progress_callback: Optional[ProgressCallback] = None,
-    cancel_event:      Optional[threading.Event]  = None,
-) -> None:
-    """
-    Render satu segmen video dengan filtergraph lengkap.
-
-    Parameter
-    ---------
-    input_path      : File video sumber.
-    output_path     : File output segmen.
-    start_sec       : Titik mulai potong (detik).
-    duration_sec    : Durasi segmen (detik).
-    zoom_crop_pct   : Persentase crop per-sisi untuk anti-copyright (5–10).
-    preset          : RenderPreset yang berisi codec, crf, dll.
-    watermark_cfg   : Konfigurasi teks watermark.
-    hwaccel_cfg     : Konfigurasi hardware acceleration.
-    log_callback    : Dipanggil dengan string log setiap baris stderr.
-    progress_callback : Dipanggil dengan float 0.0–100.0 kemajuan segmen ini.
-    cancel_event    : threading.Event; jika set, proses FFmpeg akan dihentikan.
-
-    Raise
-    -----
-    RuntimeError    : Jika FFmpeg keluar dengan kode error.
-    """
-
-    def _log(msg: str) -> None:
-        if log_callback:
-            log_callback(msg)
-
-    ffmpeg_bin = find_ffmpeg()
-
-    # --- Probe info video sumber ---
-    info = probe_video(input_path)
-    _log(f"[probe] {input_path.name}: {info.width}x{info.height}, "
-         f"{info.duration:.2f}s, {info.fps:.2f}fps")
-
-    # --- Deteksi HW encoder jika preset memintanya ---
-    effective_vcodec = preset.video_codec
-    if "nvenc" in preset.video_codec or "videotoolbox" in preset.video_codec or "amf" in preset.video_codec:
-        hw = detect_available_hwaccel(hwaccel_cfg)
-        if hw is None:
-            _log(f"[hwaccel] Encoder HW '{preset.video_codec}' tidak tersedia, "
-                 f"fallback ke libx264.")
-            effective_vcodec = "libx264"
-        else:
-            effective_vcodec = hw
-            _log(f"[hwaccel] Menggunakan encoder HW: {effective_vcodec}")
-    else:
-        _log(f"[codec] Menggunakan encoder: {effective_vcodec}")
-
-    # --- Bangun filtergraph ---
-    filtergraph = _build_filtergraph(
-        src_width=info.width,
-        src_height=info.height,
-        zoom_crop_pct=zoom_crop_pct,
-        watermark_cfg=watermark_cfg,
-    )
-    _log(f"[filtergraph] {filtergraph[:120]}{'...' if len(filtergraph) > 120 else ''}")
-
-    # --- Susun perintah FFmpeg ---
-    cmd: list[str] = [
-        ffmpeg_bin,
-        "-y",                        # Timpa output tanpa tanya
-        "-ss",  f"{start_sec:.3f}",  # Seek sebelum input (fast seek)
-        "-i",   str(input_path),
-        "-t",   f"{duration_sec:.3f}",
-        "-filter_complex", filtergraph,
-        "-map", "[vout]",
+    cmd = [
+        ffmpeg_bin(),
+        "-y",                           # overwrite if exists
+        "-ss", f"{seg.start:.3f}",
+        "-i", str(source),
+        "-t",  f"{seg.duration:.3f}",
+        "-c",  "copy",                  # stream copy — no re-encode
+        "-avoid_negative_ts", "make_zero",
+        str(tmp_path),
     ]
 
-    # Audio
-    if info.has_audio:
-        cmd += ["-map", "0:a"]
-        cmd += ["-c:a", preset.audio_codec]
-        if preset.audio_codec != "copy":
-            cmd += ["-b:a", preset.audio_bitrate]
-    else:
-        cmd += ["-an"]
+    log.debug("Stream-copy cut cmd: %s", " ".join(cmd))
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Stream-copy cut failed for segment {seg.index}: "
+            f"{result.stderr[-800:].strip()}"
+        )
 
-    # Video codec dan quality
-    cmd += ["-c:v", effective_vcodec]
+    log.debug("Stream-copy cut done → %s (%.1f MB)", tmp_path.name, tmp_path.stat().st_size / 1e6)
+    return tmp_path
 
-    # CRF hanya untuk software encoder
-    is_software = effective_vcodec in ("libx264", "libx265", "libvpx-vp9")
-    if is_software and preset.crf > 0:
-        cmd += ["-crf", str(preset.crf)]
 
-    cmd += ["-preset", preset.preset]
-    cmd += ["-pix_fmt", preset.pixel_format]
+# ── 5. Encode segment ──────────────────────────────────────────────────────
 
-    if preset.threads > 0:
-        cmd += ["-threads", str(preset.threads)]
+def encode_segment(
+    tmp_source:     Path,
+    output_path:    Path,
+    info:           VideoInfo,
+    seg:            SegmentPlan,
+    preset_cfg:     dict,
+    subtitle_mode:  str = "keep",
+    progress_cb:    Optional[Callable[[float, float, float], None]] = None,
+    stop_flag:      Optional[Callable[[], bool]] = None,
+) -> None:
+    """
+    Full-quality encode of *tmp_source* to *output_path*.
 
-    # Extra flags dari preset (pasangan datar)
-    if preset.extra_flags:
-        cmd += preset.extra_flags
+    Parameters
+    ──────────
+    tmp_source   : output of stream_copy_cut() for this segment
+    output_path  : final destination .mp4 (or .webm) file
+    info         : VideoInfo of the *original* source (for filtergraph dims)
+    seg          : SegmentPlan for this segment (carries zoom)
+    preset_cfg   : one entry from RENDER_PRESETS
+    subtitle_mode: "keep" | "burn" | "disable"
+    progress_cb  : called with (seg_pct: float, fps: float, speed: float)
+    stop_flag    : callable returning True if the encode should be aborted
 
-    # Progress pipe: minta FFmpeg mengirim data progres ke stderr terstruktur
-    cmd += ["-progress", "pipe:2"]
-
-    cmd += [str(output_path)]
-
-    _log(f"[cmd] {' '.join(cmd)}")
-
-    # --- Jalankan FFmpeg ---
+    The function blocks until FFmpeg exits or *stop_flag* returns True.
+    On abort, the partial output file is deleted.
+    Raises RuntimeError on failure.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"Gagal menjalankan FFmpeg: {exc}") from exc
+    filtergraph = build_filtergraph(info, seg)
 
-    _log(f"[start] PID={proc.pid}, output={output_path.name}")
+    vcodec  = preset_cfg["video_codec"]
+    crf     = preset_cfg["crf"]
+    enc_preset = preset_cfg.get("preset")
+    acodec  = preset_cfg["audio_codec"]
+    abitrate = preset_cfg["audio_bitrate"]
+    pix_fmt = preset_cfg["pixel_format"]
+    extra   = preset_cfg.get("extra_vargs", [])
 
-    # Perkiraan total frame segmen untuk kalkulasi persen
-    estimated_frames = max(1, int(duration_sec * info.fps))
-    last_progress_pct = 0.0
-    last_activity_time = time.monotonic()
+    cmd: List[str] = [
+        ffmpeg_bin(),
+        "-y",
+        "-i", str(tmp_source),
+    ]
 
-    # Baca stderr baris per baris (non-blocking via thread reader)
-    stderr_lines: list[str] = []
-    stderr_lock  = threading.Lock()
-    eof_event    = threading.Event()
+    # Audio: if source has no audio, generate silence
+    if not info.has_audio:
+        cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
 
-    def _stderr_reader() -> None:
-        """Thread pembaca stderr FFmpeg."""
-        assert proc.stderr is not None
-        for line in proc.stderr:
-            line = line.rstrip("\n")
-            with stderr_lock:
-                stderr_lines.append(line)
-        eof_event.set()
+    cmd += [
+        "-filter_complex", filtergraph,
+        "-map", "[vout]",
+        "-map", "0:a?" if info.has_audio else "1:a",
+        "-c:v", vcodec,
+        "-crf", str(crf),
+    ]
 
-    reader_thread = threading.Thread(target=_stderr_reader, daemon=True)
-    reader_thread.start()
+    if enc_preset:
+        cmd += ["-preset", enc_preset]
 
-    # Loop monitoring utama
-    while True:
-        # Cek permintaan cancel
-        if cancel_event is not None and cancel_event.is_set():
-            _log("[cancel] Cancel diminta, menghentikan FFmpeg...")
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            raise RuntimeError("Render dibatalkan oleh pengguna.")
+    cmd += [
+        "-pix_fmt", pix_fmt,
+        "-c:a", acodec,
+        "-b:a", abitrate,
+    ]
+    cmd += extra
 
-        # Drain baris stderr
-        with stderr_lock:
-            lines_to_process = list(stderr_lines)
-            stderr_lines.clear()
+    # Subtitle handling
+    if subtitle_mode == "disable":
+        cmd += ["-sn"]
+    elif subtitle_mode == "burn":
+        # Burning subtitles requires a separate subtitles filter — placeholder
+        # for now; burn mode falls back to keep (complex to implement generically)
+        log.warning("Subtitle burn mode not yet implemented — falling back to keep")
+        cmd += ["-c:s", "copy"] if subtitle_mode != "disable" else ["-sn"]
+    else:
+        # keep: copy subtitle streams if present
+        cmd += ["-c:s", "copy"]
 
-        for line in lines_to_process:
-            _log(f"[ffmpeg] {line}")
-            parsed = _parse_progress_line(line)
-            if parsed:
-                last_activity_time = time.monotonic()
-                pct = min(100.0, (parsed["elapsed_sec"] / duration_sec) * 100.0)
-                if pct > last_progress_pct:
-                    last_progress_pct = pct
-                    if progress_callback:
-                        progress_callback(pct)
+    # Progress via stderr pipe
+    cmd += [
+        "-progress", "pipe:2",
+        "-stats_period", "0.5",
+        str(output_path),
+    ]
 
-        # Cek timeout hang
-        if time.monotonic() - last_activity_time > FFMPEG_HANG_TIMEOUT:
-            _log(f"[timeout] FFmpeg tidak merespons selama {FFMPEG_HANG_TIMEOUT}s, membunuh proses.")
-            proc.kill()
-            raise RuntimeError(f"FFmpeg timeout setelah {FFMPEG_HANG_TIMEOUT} detik.")
+    log.info("Encoding segment %d → %s", seg.index, output_path.name)
+    log.debug("Encode cmd: %s", " ".join(cmd))
 
-        # Cek apakah proses sudah selesai
-        retcode = proc.poll()
-        if retcode is not None:
-            # Tunggu reader selesai
-            eof_event.wait(timeout=5.0)
-            # Drain sisa
-            with stderr_lock:
-                for line in stderr_lines:
-                    _log(f"[ffmpeg] {line}")
-            break
+    proc = subprocess.Popen(
+        cmd,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
 
-        time.sleep(0.1)
+    total_frames = max(1, int(info.fps * seg.duration))
+    _parse_and_stream_progress(proc, total_frames, seg.duration, progress_cb, stop_flag)
+
+    proc.wait()
+
+    if stop_flag and stop_flag():
+        log.info("Encode of segment %d aborted by stop flag", seg.index)
+        output_path.unlink(missing_ok=True)
+        return
 
     if proc.returncode != 0:
+        output_path.unlink(missing_ok=True)
         raise RuntimeError(
-            f"FFmpeg keluar dengan kode {proc.returncode}. "
-            f"Periksa log untuk detail error."
+            f"FFmpeg encode failed for segment {seg.index} "
+            f"(exit {proc.returncode})"
         )
 
-    # Pastikan progress 100% terkirim
-    if progress_callback:
-        progress_callback(100.0)
+    log.info(
+        "Segment %d encoded → %s (%.1f MB)",
+        seg.index,
+        output_path.name,
+        output_path.stat().st_size / 1e6,
+    )
 
-    _log(f"[done] Segmen selesai: {output_path.name}")
+
+# ── Progress parser ─────────────────────────────────────────────────────────
+
+_KV_RE = re.compile(r"^(\w+)=(.+)$")
+
+
+def _parse_and_stream_progress(
+    proc:         subprocess.Popen,
+    total_frames: int,
+    total_secs:   float,
+    progress_cb:  Optional[Callable[[float, float, float], None]],
+    stop_flag:    Optional[Callable[[], bool]],
+) -> None:
+    """
+    Read FFmpeg's `-progress pipe:2` key=value lines from *proc.stderr*
+    and call *progress_cb(seg_pct, fps, speed)* on each 'progress=...' line.
+
+    Also polls *stop_flag* and terminates *proc* if requested.
+    """
+    if proc.stderr is None:
+        return
+
+    kv: dict[str, str] = {}
+
+    for raw_line in proc.stderr:
+        if stop_flag and stop_flag():
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            return
+
+        line = raw_line.strip()
+        m = _KV_RE.match(line)
+        if m:
+            kv[m.group(1)] = m.group(2)
+
+        if line.startswith("progress="):
+            # A complete progress block has been emitted
+            try:
+                frame    = int(kv.get("frame",   "0"))
+                fps_val  = float(kv.get("fps",   "0"))
+                speed_s  = kv.get("speed", "0x").rstrip("x")
+                speed    = float(speed_s) if speed_s.replace(".", "").isdigit() else 0.0
+                seg_pct  = min(100.0, (frame / total_frames) * 100.0)
+
+                if progress_cb:
+                    progress_cb(seg_pct, fps_val, speed)
+            except (ValueError, ZeroDivisionError):
+                pass
+            kv.clear()

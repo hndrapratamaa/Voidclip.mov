@@ -1,10 +1,15 @@
 from __future__ import annotations
+
 from typing import Optional
+
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QPlainTextEdit,
-    QProgressBar, QPushButton, QVBoxLayout, QWidget
+    QHBoxLayout, QLabel, QProgressBar,
+    QPushButton, QVBoxLayout, QWidget,
+)
+
+from backend.lang_id import (
+    MSG_IDLE,
 )
 
 
@@ -43,11 +48,16 @@ class RenderPanel(QWidget):
         self.stats_grid.setSpacing(8)
 
         self._seg_label   = self._stat_box("SEGMENT", "0 / 0")
-        self._fps_label   = self._stat_box("FPS LIVE", "0.0")
+        self._fps_label   = self._stat_box("FPS", "0.0")
         self._speed_label = self._stat_box("SPEED", "0.00×")
         self._eta_label   = self._stat_box("ETA", "0m 0s")
 
-        for box in [self._seg_label, self._fps_label, self._speed_label, self._eta_label]:
+        for box in [
+            self._seg_label,
+            self._fps_label,
+            self._speed_label,
+            self._eta_label,
+        ]:
             self.stats_grid.addWidget(box)
 
         self.pb_segment = QProgressBar()
@@ -55,51 +65,31 @@ class RenderPanel(QWidget):
         self.pb_segment.setFixedHeight(12)
 
         self.pb_overall = QProgressBar()
+        self.pb_overall.setObjectName("overallBar")
         self.pb_overall.setFormat("Overall: %p%")
         self.pb_overall.setFixedHeight(12)
 
-        self.log_output = QPlainTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setPlaceholderText("Terminal output will appear here…")
-
-        self.btn_start    = NeuButton("▶  Render",     role="accentBtn")
-        self.btn_pause    = NeuButton("⏸  Pause")
-        self.btn_continue = NeuButton("▶  Lanjut")
-        self.btn_stop     = NeuButton("⏹  Stop",       role="dangerBtn")
-        self.btn_refresh  = NeuButton("↺  Refresh")
-
-        self.btn_clear_log = NeuButton("🗑 Clear")
-        self.btn_clear_log.setFixedSize(68, 22)
-        self.btn_clear_log.setStyleSheet("font-size: 10px; padding: 2px 6px;")
-        self.btn_clear_log.clicked.connect(self._clear_log)
-
-        self.btn_copy_log = NeuButton("⎘ Copy")
-        self.btn_copy_log.setFixedSize(68, 22)
-        self.btn_copy_log.setStyleSheet("font-size: 10px; padding: 2px 6px;")
-        self.btn_copy_log.clicked.connect(self._copy_log)
-
-        self.btn_start.clicked.connect(self._on_start_clicked)
-        self.btn_pause.clicked.connect(self._on_pause_clicked)
-        self.btn_stop.clicked.connect(self._on_stop_clicked)
-        self.btn_continue.clicked.connect(self._on_continue_clicked)
+        self.btn_start    = NeuButton("▶  MULAI RENDER", role="accentBtn")
+        self.btn_pause    = NeuButton("⏸  BENTAR")
+        self.btn_continue = NeuButton("▶  LANJUT")
+        self.btn_stop     = NeuButton("⏹  BERENTI",     role="dangerBtn")
+        self.btn_refresh  = NeuButton("↺  SEGERIN")
 
     def _stat_box(self, title: str, val: str) -> QWidget:
         box = QWidget()
-        box.setStyleSheet(
-            "background-color: #0c0e14;"
-            "border: 1px solid #252d40;"
-            "border-radius: 8px;"
-        )
+        box.setProperty("role", "card-inset")
         lyt = QVBoxLayout(box)
         lyt.setContentsMargins(8, 6, 8, 6)
         lyt.setSpacing(2)
 
         t = QLabel(title)
-        t.setStyleSheet("font-size: 9px; color: #4a5568; font-weight: 700; letter-spacing: 1px;")
+        t.setProperty("role", "sectionTitle")
         t.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         v = QLabel(val)
-        v.setStyleSheet("font-size: 14px; color: #0a84ff; font-weight: 700;")
+        v.setStyleSheet(
+            "font-size: 14px; color: #0a84ff; font-weight: 700; background: transparent;"
+        )
         v.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         box._val_lbl = v
@@ -121,15 +111,8 @@ class RenderPanel(QWidget):
     def _on_continue_clicked(self) -> None:
         self.btn_continue.press_down()
 
-    def _clear_log(self) -> None:
-        self.log_output.clear()
-
-    def _copy_log(self) -> None:
-        QApplication.clipboard().setText(self.log_output.toPlainText())
-
     def write_log(self, msg: str) -> None:
-        self.log_output.appendPlainText(msg)
-        self.log_output.moveCursor(QTextCursor.End)
+        pass
 
     def update_progress(
         self,
@@ -147,10 +130,14 @@ class RenderPanel(QWidget):
 
     def update_state(self, state) -> None:
         from backend.queue_manager import QueueState
-        idle    = state == QueueState.IDLE
+        idle   = state == QueueState.IDLE
         running = state == QueueState.RUNNING
         paused  = state == QueueState.PAUSED
-        busy    = state in [QueueState.RUNNING, QueueState.PAUSED, QueueState.QUEUEING]
+        busy    = state in (
+            QueueState.RUNNING,
+            QueueState.PAUSED,
+            QueueState.QUEUEING,
+        )
 
         self.btn_start.setEnabled(idle)
         self.btn_pause.setEnabled(running)

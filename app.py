@@ -1,17 +1,6 @@
-"""
-app.py
-─────────────────────────────────────────────────────────────────────────────
-Voidclip.mov — Application Entry Point
-
-Run:
-    python app.py
-─────────────────────────────────────────────────────────────────────────────
-"""
-
 import sys
 import os
 
-# Ensure project root is on sys.path when running from any CWD
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backend.logger import setup_logging
